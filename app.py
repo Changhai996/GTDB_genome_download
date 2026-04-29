@@ -221,6 +221,8 @@ def clean_and_rename_genomes(input_dirs, output_main_dir, prefix="GENOME"):
     Uses MD5 hashing to skip physical duplicates.
     Prioritizes files that look like NCBI accessions (GCA/GCF).
     """
+    if os.path.exists(output_main_dir):
+        shutil.rmtree(output_main_dir)
     os.makedirs(output_main_dir, exist_ok=True)
     report = []
     
@@ -306,6 +308,8 @@ def run_fastani_dereplication(input_dir, output_dir, fastani_path, ani_threshold
     Run FastANI all-vs-all to identify sequence-level duplicates.
     Keep one representative per cluster and move to output_dir.
     """
+    if os.path.exists(output_dir):
+        shutil.rmtree(output_dir)
     os.makedirs(output_dir, exist_ok=True)
     
     genomes = [os.path.join(input_dir, f) for f in os.listdir(input_dir) if f.endswith(('.fna', '.fasta', '.fa'))]
