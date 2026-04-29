@@ -218,52 +218,55 @@ def get_file_hash(filepath):
 def clean_and_rename_genomes(input_dirs, output_main_dir, prefix="GENOME"):
     """
     Clean, rename and organize genomes from multiple directories.
-    Returns a report of changes.
+    Uses MD5 hashing to skip physical duplicates.
+    Prioritizes files that look like NCBI accessions (GCA/GCF).
     """
     os.makedirs(output_main_dir, exist_ok=True)
     report = []
-    seen_hashes = {} # hash -> original_path
-    genome_counter = 1
+    
+    # First pass: collect all files and their hashes
+    hash_to_files = {} # hash -> list of file info
     
     for input_dir in input_dirs:
         if not os.path.exists(input_dir):
             continue
-            
         for filename in os.listdir(input_dir):
             if filename.endswith(('.fna', '.fasta', '.fa')):
-                old_path = os.path.join(input_dir, filename)
-                file_hash = get_file_hash(old_path)
-                
-                if file_hash in seen_hashes:
-                    report.append({
-                        "Original_Name": filename,
-                        "Source_Dir": input_dir,
-                        "Status": "Duplicate (Skipped)",
-                        "New_Name": "-",
-                        "Note": f"Same as {os.path.basename(seen_hashes[file_hash])}"
-                    })
-                    continue
-                
-                new_filename = f"{prefix}_{genome_counter:04d}.fasta"
-                new_path = os.path.join(output_main_dir, new_filename)
-                
-                # Copy and rename file
-                shutil.copy2(old_path, new_path)
-                seen_hashes[file_hash] = old_path
-                
-                # Internal sequence renaming (Simplified)
-                # In a real scenario, we might use Biopython to rename headers
-                
-                report.append({
-                    "Original_Name": filename,
-                    "Source_Dir": input_dir,
-                    "Status": "Success",
-                    "New_Name": new_filename,
-                    "Note": "New genome added"
-                })
-                genome_counter += 1
+                filepath = os.path.join(input_dir, filename)
+                f_hash = get_file_hash(filepath)
+                if f_hash not in hash_to_files:
+                    hash_to_files[f_hash] = []
+                hash_to_files[f_hash].append({'path': filepath, 'name': filename})
+
+    genome_counter = 1
+    for f_hash, file_list in hash_to_files.items():
+        # Heuristic: Pick the "best" filename among duplicates
+        # Priority: 1. Contains GCA/GCF, 2. Shortest name (often cleaner)
+        best_file = file_list[0]
+        for f in file_list:
+            if re.search(r'GC[AF]_\d+\.\d+', f['name']):
+                best_file = f
+                break
+        
+        new_filename = f"{prefix}_{genome_counter:04d}.fasta"
+        new_path = os.path.join(output_main_dir, new_filename)
+        
+        shutil.copy2(best_file['path'], new_path)
+        
+        report.append({
+            "Selected_Source": best_file['name'],
+            "Original_Count": len(file_list),
+            "New_Name": new_filename,
+            "Other_Names": ", ".join([f['name'] for f in file_list if f['name'] != best_file['name']])
+        })
+        genome_counter += 1
                 
     return pd.DataFrame(report)
+
+def extract_accession_from_filename(name):
+    """Extract GCA/GCF accession from string."""
+    match = re.search(r'(GC[AF]_\d+\.\d+)', name)
+    return match.group(1) if match else None
 
 def run_drep(input_dir, output_dir, comp_threshold=50, cont_threshold=10):
     """Placeholder for dRep execution."""
@@ -522,5 +525,60 @@ with tab4:
                 
                 st.code(drep_cmd, language="bash")
                 st.markdown(f"**Output directory will be:** `{os.path.abspath(drep_out)}`")
+                
+                # --- New Dataset vs GTDB Comparison Section ---
+                st.header("Step 3: Compare with GTDB Taxon")
+                st.markdown("Compare your integrated dataset with a specific GTDB release and taxon.")
+                
+                comp_col1, comp_col2 = st.columns(2)
+                with comp_col1:
+                    gtdb_v = st.selectbox("Select GTDB Version to compare", versions, index=len(versions)-1, key="upd_gtdb_v")
+                with comp_col2:
+                    gtdb_t = st.text_input("Enter GTDB Taxon (e.g., c__Bathyarchaeia)", "c__Bathyarchaeia", key="upd_gtdb_t")
+                
+                if st.button("Compare Dataset vs GTDB"):
+                    # 1. Get GTDB Accessions for that taxon
+                    df_gtdb = df[(df['Version'] == gtdb_v) & (df['Taxonomy'].str.contains(gtdb_t, na=False))]
+                    gtdb_accs = set([g[3:] if g.startswith(("RS_", "GB_")) else g for g in df_gtdb['Genome_ID']])
+                    
+                    # 2. Get My Dataset Accessions (from report_df)
+                    # We look at all filenames in the original folders that were mapped to this dataset
+                    my_accs = set()
+                    for idx, row in report_df.iterrows():
+                        # Check selected source and other names for accessions
+                        all_names = [row['Selected_Source']] + (row['Other_Names'].split(", ") if row['Other_Names'] else [])
+                        for name in all_names:
+                            acc = extract_accession_from_filename(name)
+                            if acc:
+                                my_accs.add(acc)
+                    
+                    if not my_accs:
+                        st.warning("No NCBI Accessions (GCA/GCF) detected in your local filenames. Comparison is only possible if filenames contain accessions.")
+                    else:
+                        common = my_accs.intersection(gtdb_accs)
+                        only_me = my_accs - gtdb_accs
+                        only_gtdb = gtdb_accs - my_accs
+                        
+                        st.subheader(f"Composition Comparison: My Dataset vs GTDB R{gtdb_v} ({gtdb_t})")
+                        
+                        m1, m2, m3 = st.columns(3)
+                        m1.metric("Common (Overlap)", len(common))
+                        m2.metric("Only in My Dataset", len(only_me))
+                        m3.metric("Only in GTDB", len(only_gtdb))
+                        
+                        c_tab1, c_tab2, c_tab3 = st.tabs(["🤝 Common", "🏠 Only Me", "🌍 Only GTDB"])
+                        
+                        with c_tab1:
+                            st.write(f"These {len(common)} genomes are present in both sets.")
+                            st.dataframe(pd.DataFrame({"Accession": list(common)}))
+                            
+                        with c_tab2:
+                            st.write(f"These {len(only_me)} genomes are in your local folders but NOT in the GTDB {gtdb_t} group.")
+                            st.dataframe(pd.DataFrame({"Accession": list(only_me)}))
+                            
+                        with c_tab3:
+                            st.write(f"These {len(only_gtdb)} genomes are in GTDB {gtdb_t} but NOT in your local folders.")
+                            st.dataframe(pd.DataFrame({"Accession": list(only_gtdb)}))
             else:
                 st.warning("No genome files (.fna, .fasta, .fa) found in the provided directories.")
+
