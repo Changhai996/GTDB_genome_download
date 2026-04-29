@@ -215,11 +215,11 @@ def get_file_hash(filepath):
             hash_md5.update(chunk)
     return hash_md5.hexdigest()
 
-def clean_and_rename_genomes(input_dirs, output_main_dir, prefix="GENOME"):
+def clean_and_rename_genomes(input_dirs, output_main_dir):
     """
-    Clean, rename and organize genomes from multiple directories.
+    Clean and organize genomes from multiple directories.
     Uses MD5 hashing to skip physical duplicates.
-    Prioritizes files that look like NCBI accessions (GCA/GCF).
+    Keeps the original filename, avoiding collisions by appending a counter if needed.
     """
     if os.path.exists(output_main_dir):
         shutil.rmtree(output_main_dir)
@@ -240,7 +240,8 @@ def clean_and_rename_genomes(input_dirs, output_main_dir, prefix="GENOME"):
                     hash_to_files[f_hash] = []
                 hash_to_files[f_hash].append({'path': filepath, 'name': filename})
 
-    genome_counter = 1
+    used_filenames = set()
+    
     for f_hash, file_list in hash_to_files.items():
         # Heuristic: Pick the "best" filename among duplicates
         # Priority: 1. Contains GCA/GCF, 2. Shortest name (often cleaner)
@@ -250,7 +251,17 @@ def clean_and_rename_genomes(input_dirs, output_main_dir, prefix="GENOME"):
                 best_file = f
                 break
         
-        new_filename = f"{prefix}_{genome_counter:04d}.fasta"
+        original_name = best_file['name']
+        new_filename = original_name
+        counter = 1
+        
+        # Prevent filename collisions if different genomes somehow have the same name
+        while new_filename in used_filenames:
+            name_part, ext_part = os.path.splitext(original_name)
+            new_filename = f"{name_part}_{counter}{ext_part}"
+            counter += 1
+            
+        used_filenames.add(new_filename)
         new_path = os.path.join(output_main_dir, new_filename)
         
         shutil.copy2(best_file['path'], new_path)
@@ -261,7 +272,6 @@ def clean_and_rename_genomes(input_dirs, output_main_dir, prefix="GENOME"):
             "New_Name": new_filename,
             "Other_Names": ", ".join([f['name'] for f in file_list if f['name'] != best_file['name']])
         })
-        genome_counter += 1
                 
     return pd.DataFrame(report)
 
@@ -637,7 +647,6 @@ with tab4:
         input_dirs_raw = st.text_area("Enter paths to local genome folders (one per line):", 
                                      help="Example: /Users/user/genomes/bathy_v1\n/Users/user/genomes/bathy_v2")
         output_name = st.text_input("New Dataset Name:", "Bathyarchaeia_Combined")
-        genome_prefix = st.text_input("Genome ID Prefix:", "BATHY")
         derep_ani_thresh = st.slider("Dereplication ANI Threshold (%)", min_value=99.0, max_value=100.0, value=99.9, step=0.1, help="Genomes with ANI >= this threshold will be considered identical duplicates.")
         derep_af_thresh = st.slider("Dereplication AF Threshold (%)", min_value=10.0, max_value=100.0, value=60.0, step=1.0, help="Genomes must also have an Alignment Fraction (AF) >= this threshold to be considered duplicates.")
         threads = st.number_input("Threads to use for FastANI", min_value=1, max_value=64, value=4)
@@ -651,8 +660,8 @@ with tab4:
             derep_out = f"local_datasets/{output_name}/2_dereplicated_genomes"
             status_container = st.empty()
             
-            with st.spinner("Step 1: Physical Hashing, Cleaning, and Renaming..."):
-                report_df = clean_and_rename_genomes(input_dirs, combined_out, prefix=genome_prefix)
+            with st.spinner("Step 1: Physical Hashing and Cleaning..."):
+                report_df = clean_and_rename_genomes(input_dirs, combined_out)
                 
             if not report_df.empty:
                 # Install/Check FastANI
