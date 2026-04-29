@@ -273,6 +273,45 @@ with tab2:
             st.write(f"- **Newly added genomes:** {len(new_genomes)}")
             st.write(f"- **Genomes no longer in this group:** {len(genomes_v1 - genomes_v2)}")
             
+            # --- New Detailed Comparison Section ---
+            st.markdown("### Detailed Comparison Details")
+            
+            diff_tab1, diff_tab2, diff_tab3 = st.tabs(["🆕 Added Genomes", "❌ Removed/Moved Genomes", "🔄 Taxonomy Updates"])
+            
+            with diff_tab1:
+                if new_genomes:
+                    st.write(f"Showing {len(new_genomes)} genomes added in R{v2}:")
+                    st.dataframe(df_v2[df_v2['Genome_ID'].isin(new_genomes)][['Genome_ID', 'Taxonomy']])
+                else:
+                    st.info("No new genomes added in this version.")
+                    
+            with diff_tab2:
+                removed_genomes = genomes_v1 - genomes_v2
+                if removed_genomes:
+                    st.write(f"Showing {len(removed_genomes)} genomes removed from this group in R{v2}:")
+                    # Find where they went in R2
+                    lost_df = df_v1[df_v1['Genome_ID'].isin(removed_genomes)][['Genome_ID', 'Taxonomy']]
+                    where_went = df[(df['Version'] == v2) & (df['Genome_ID'].isin(removed_genomes))][['Genome_ID', 'Taxonomy']]
+                    where_went = where_went.rename(columns={'Taxonomy': f'New_Taxonomy_R{v2}'})
+                    lost_compare = lost_df.merge(where_went, on='Genome_ID', how='left')
+                    st.dataframe(lost_compare)
+                else:
+                    st.info("No genomes were removed or moved.")
+                    
+            with diff_tab3:
+                retained_genomes = genomes_v1 & genomes_v2
+                df_retained_v1 = df_v1[df_v1['Genome_ID'].isin(retained_genomes)][['Genome_ID', 'Taxonomy']].set_index('Genome_ID')
+                df_retained_v2 = df_v2[df_v2['Genome_ID'].isin(retained_genomes)][['Genome_ID', 'Taxonomy']].set_index('Genome_ID')
+                retained_compare = df_retained_v1.join(df_retained_v2, lsuffix=f'_R{v1}', rsuffix=f'_R{v2}')
+                changed_tax = retained_compare[retained_compare[f'Taxonomy_R{v1}'] != retained_compare[f'Taxonomy_R{v2}']]
+                
+                if not changed_tax.empty:
+                    st.write(f"Showing {len(changed_tax)} genomes with updated taxonomy strings in R{v2}:")
+                    st.dataframe(changed_tax)
+                else:
+                    st.info("No taxonomy updates found for retained genomes.")
+            # --- End of Detailed Comparison Section ---
+
             dl_col1, dl_col2 = st.columns(2)
             with dl_col1:
                 if st.button(f"Download ALL ({len(df_v2)}) in R{v2}", key="dl_all"):
