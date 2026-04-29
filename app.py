@@ -204,6 +204,74 @@ def download_genomes(genome_list, output_dir, zip_name="dataset.zip", progress_b
         return False, f"Completed with errors. {failed_batches} batches failed. Successfully saved {successful_downloads}/{total_genomes} genomes.", success_list, failed_list
 
 
+import shutil
+import hashlib
+
+def get_file_hash(filepath):
+    """Calculate MD5 hash of a file to detect exact duplicates."""
+    hash_md5 = hashlib.md5()
+    with open(filepath, "rb") as f:
+        for chunk in iter(lambda: f.read(4096), b""):
+            hash_md5.update(chunk)
+    return hash_md5.hexdigest()
+
+def clean_and_rename_genomes(input_dirs, output_main_dir, prefix="GENOME"):
+    """
+    Clean, rename and organize genomes from multiple directories.
+    Returns a report of changes.
+    """
+    os.makedirs(output_main_dir, exist_ok=True)
+    report = []
+    seen_hashes = {} # hash -> original_path
+    genome_counter = 1
+    
+    for input_dir in input_dirs:
+        if not os.path.exists(input_dir):
+            continue
+            
+        for filename in os.listdir(input_dir):
+            if filename.endswith(('.fna', '.fasta', '.fa')):
+                old_path = os.path.join(input_dir, filename)
+                file_hash = get_file_hash(old_path)
+                
+                if file_hash in seen_hashes:
+                    report.append({
+                        "Original_Name": filename,
+                        "Source_Dir": input_dir,
+                        "Status": "Duplicate (Skipped)",
+                        "New_Name": "-",
+                        "Note": f"Same as {os.path.basename(seen_hashes[file_hash])}"
+                    })
+                    continue
+                
+                new_filename = f"{prefix}_{genome_counter:04d}.fasta"
+                new_path = os.path.join(output_main_dir, new_filename)
+                
+                # Copy and rename file
+                shutil.copy2(old_path, new_path)
+                seen_hashes[file_hash] = old_path
+                
+                # Internal sequence renaming (Simplified)
+                # In a real scenario, we might use Biopython to rename headers
+                
+                report.append({
+                    "Original_Name": filename,
+                    "Source_Dir": input_dir,
+                    "Status": "Success",
+                    "New_Name": new_filename,
+                    "Note": "New genome added"
+                })
+                genome_counter += 1
+                
+    return pd.DataFrame(report)
+
+def run_drep(input_dir, output_dir, comp_threshold=50, cont_threshold=10):
+    """Placeholder for dRep execution."""
+    # This would normally be: subprocess.run(["dRep", "dereplicate", output_dir, "-g", input_dir + "/*.fasta", ...])
+    # Since dRep is not in the environment, we'll provide the command for the user
+    cmd = f"dRep dereplicate {output_dir} -g {input_dir}/*.fasta --completeness {comp_threshold} --contamination {cont_threshold}"
+    return cmd
+
 st.title("GTDB & NCBI Genomes Toolkit")
 
 df = load_data()
@@ -213,7 +281,7 @@ if df.empty:
 
 versions = sorted(df['Version'].unique())
 
-tab1, tab2, tab3 = st.tabs(["🔍 Single Version Explorer", "📊 Version Comparison", "📥 Custom Download & Email"])
+tab1, tab2, tab3, tab4 = st.tabs(["🔍 Single Version Explorer", "📊 Version Comparison", "📥 Custom Download & Email", "📦 Dataset Updater"])
 
 with tab1:
     st.header("Single Version Explorer")
@@ -402,3 +470,57 @@ with tab3:
                     st.error(f"Download finished, but failed to send email: {email_msg}")
             else:
                 st.error("NCBI Datasets CLI could not be installed.")
+
+with tab4:
+    st.header("Local Dataset Updater & Dereplication")
+    st.markdown("""
+    This module helps you integrate genomes from multiple local folders, perform basic cleaning/renaming, 
+    and provides commands for dereplication (dRep).
+    """)
+    
+    with st.expander("Step 1: Configure Input Directories", expanded=True):
+        input_dirs_raw = st.text_area("Enter paths to local genome folders (one per line):", 
+                                     help="Example: /Users/user/genomes/bathy_v1\n/Users/user/genomes/bathy_v2")
+        output_name = st.text_input("New Dataset Name:", "Bathyarchaeia_Combined")
+        genome_prefix = st.text_input("Genome ID Prefix:", "BATHY")
+        
+    if st.button("Analyze & Integrate Datasets"):
+        input_dirs = [d.strip() for d in input_dirs_raw.split('\n') if d.strip()]
+        if not input_dirs:
+            st.error("Please provide at least one input directory.")
+        else:
+            combined_out = f"local_datasets/{output_name}/cleaned_genomes"
+            
+            with st.spinner("Processing genomes (Hashing, Cleaning, Renaming)..."):
+                report_df = clean_and_rename_genomes(input_dirs, combined_out, prefix=genome_prefix)
+                
+            if not report_df.empty:
+                st.success(f"Integration complete! Genomes saved to: `{os.path.abspath(combined_out)}`")
+                
+                # Display Summary Statistics
+                col_s1, col_s2, col_s3 = st.columns(3)
+                total_found = len(report_df)
+                success_count = len(report_df[report_df['Status'] == 'Success'])
+                dup_count = len(report_df[report_df['Status'].str.contains('Duplicate')])
+                
+                col_s1.metric("Total Files Found", total_found)
+                col_s2.metric("Unique Genomes", success_count)
+                col_s3.metric("Exact Duplicates", dup_count)
+                
+                st.subheader("Integration Report")
+                st.dataframe(report_df)
+                
+                # Step 2: dRep Integration
+                st.header("Step 2: Dereplication (dRep)")
+                st.info("""
+                dRep is used to identify representative genomes based on Average Nucleotide Identity (ANI).
+                Since dRep requires a complex environment (MASH, MUMmer, etc.), please run the following command in your terminal:
+                """)
+                
+                drep_out = f"local_datasets/{output_name}/drep_results"
+                drep_cmd = run_drep(os.path.abspath(combined_out), os.path.abspath(drep_out))
+                
+                st.code(drep_cmd, language="bash")
+                st.markdown(f"**Output directory will be:** `{os.path.abspath(drep_out)}`")
+            else:
+                st.warning("No genome files (.fna, .fasta, .fa) found in the provided directories.")
