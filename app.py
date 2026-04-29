@@ -502,13 +502,13 @@ with tab4:
                 
                 # Display Summary Statistics
                 col_s1, col_s2, col_s3 = st.columns(3)
-                total_found = len(report_df)
-                success_count = len(report_df[report_df['Status'] == 'Success'])
-                dup_count = len(report_df[report_df['Status'].str.contains('Duplicate')])
+                unique_genomes = len(report_df)
+                total_files = report_df['Original_Count'].sum()
+                dup_count = total_files - unique_genomes
                 
-                col_s1.metric("Total Files Found", total_found)
-                col_s2.metric("Unique Genomes", success_count)
-                col_s3.metric("Exact Duplicates", dup_count)
+                col_s1.metric("Total Files Found", total_files)
+                col_s2.metric("Unique Genomes", unique_genomes)
+                col_s3.metric("Exact Duplicates Filtered", dup_count)
                 
                 st.subheader("Integration Report")
                 st.dataframe(report_df)
