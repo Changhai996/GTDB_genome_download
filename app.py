@@ -301,7 +301,7 @@ def install_fastani(status_container):
     
     return os.path.join(pixi_home, "bin", "fastANI")
 
-def run_fastani_dereplication(input_dir, output_dir, fastani_path, ani_threshold=99.9, threads=4, status_text=None):
+def run_fastani_dereplication(input_dir, output_dir, fastani_path, ani_threshold=99.9, af_threshold=60.0, threads=4, status_text=None):
     """
     Run FastANI all-vs-all to identify sequence-level duplicates.
     Keep one representative per cluster and move to output_dir.
@@ -331,8 +331,9 @@ def run_fastani_dereplication(input_dir, output_dir, fastani_path, ani_threshold
     clusters = [] # list of sets
     if os.path.exists(out_file):
         df_ani = pd.read_csv(out_file, sep='\t', header=None, names=['query', 'ref', 'ani', 'matches', 'total'])
-        # Filter for high similarity
-        df_dup = df_ani[(df_ani['ani'] >= ani_threshold) & (df_ani['query'] != df_ani['ref'])]
+        df_ani['af'] = (df_ani['matches'] / df_ani['total']) * 100
+        # Filter for high similarity and high alignment fraction
+        df_dup = df_ani[(df_ani['ani'] >= ani_threshold) & (df_ani['af'] >= af_threshold) & (df_ani['query'] != df_ani['ref'])]
         
         # Build connected components
         parent = {}
@@ -379,7 +380,7 @@ def run_fastani_dereplication(input_dir, output_dir, fastani_path, ani_threshold
         return pd.DataFrame(report)
     return pd.DataFrame()
 
-def run_fastani_comparison(my_genomes_dir, gtdb_genomes_dir, fastani_path, ani_threshold=95.0, threads=4, status_text=None):
+def run_fastani_comparison(my_genomes_dir, gtdb_genomes_dir, fastani_path, ani_threshold=95.0, af_threshold=60.0, threads=4, status_text=None):
     """
     Compare user dataset vs GTDB downloaded dataset.
     """
@@ -408,9 +409,10 @@ def run_fastani_comparison(my_genomes_dir, gtdb_genomes_dir, fastani_path, ani_t
             df_ani = pd.read_csv(out_file, sep='\t', header=None, names=['query', 'ref', 'ani', 'matches', 'total'])
             df_ani['query_name'] = df_ani['query'].apply(os.path.basename)
             df_ani['ref_name'] = df_ani['ref'].apply(os.path.basename)
+            df_ani['af'] = (df_ani['matches'] / df_ani['total']) * 100
             
             # Filter by threshold
-            df_match = df_ani[df_ani['ani'] >= ani_threshold]
+            df_match = df_ani[(df_ani['ani'] >= ani_threshold) & (df_ani['af'] >= af_threshold)]
             
             if os.path.exists(my_list): os.remove(my_list)
             if os.path.exists(gtdb_list): os.remove(gtdb_list)
@@ -633,6 +635,7 @@ with tab4:
         output_name = st.text_input("New Dataset Name:", "Bathyarchaeia_Combined")
         genome_prefix = st.text_input("Genome ID Prefix:", "BATHY")
         derep_ani_thresh = st.slider("Dereplication ANI Threshold (%)", min_value=99.0, max_value=100.0, value=99.9, step=0.1, help="Genomes with ANI >= this threshold will be considered identical duplicates.")
+        derep_af_thresh = st.slider("Dereplication AF Threshold (%)", min_value=10.0, max_value=100.0, value=60.0, step=1.0, help="Genomes must also have an Alignment Fraction (AF) >= this threshold to be considered duplicates.")
         threads = st.number_input("Threads to use for FastANI", min_value=1, max_value=64, value=4)
         
     if st.button("Integrate & Dereplicate"):
@@ -658,8 +661,8 @@ with tab4:
                             st.error(f"Failed to install FastANI: {e}")
                             st.stop()
                             
-                with st.spinner(f"Step 2: Running FastANI all-vs-all dereplication (Threshold: {derep_ani_thresh}%)..."):
-                    dup_report = run_fastani_dereplication(combined_out, derep_out, fastani_path, ani_threshold=derep_ani_thresh, threads=threads, status_text=status_container)
+                with st.spinner(f"Step 2: Running FastANI all-vs-all dereplication (Threshold: {derep_ani_thresh}% ANI, {derep_af_thresh}% AF)..."):
+                    dup_report = run_fastani_dereplication(combined_out, derep_out, fastani_path, ani_threshold=derep_ani_thresh, af_threshold=derep_af_thresh, threads=threads, status_text=status_container)
                 
                 status_container.empty()
                 st.success(f"Integration & Dereplication complete! Unique genomes saved to: `{os.path.abspath(derep_out)}`")
@@ -694,6 +697,7 @@ with tab4:
         gtdb_genomes_dir = st.text_input("Path to GTDB Downloaded Folder:", "ncbi_downloads/c__Bathyarchaeia_R232_all")
         
     comp_ani_thresh = st.slider("Comparison Match ANI Threshold (%)", min_value=90.0, max_value=100.0, value=95.0, step=0.5, help="Genomes with ANI >= this threshold will be considered the same species/matched.")
+    comp_af_thresh = st.slider("Comparison Match AF Threshold (%)", min_value=10.0, max_value=100.0, value=60.0, step=1.0, help="Genomes must also have an Alignment Fraction (AF) >= this threshold to be considered matched.")
     
     if st.button("Run Sequence Comparison"):
         if not os.path.exists(my_genomes_dir) or not os.path.exists(gtdb_genomes_dir):
@@ -706,7 +710,7 @@ with tab4:
                     fastani_path = install_fastani(status_container)
                     
             with st.spinner("Running FastANI Comparison... This may take a while depending on dataset size."):
-                df_match = run_fastani_comparison(my_genomes_dir, gtdb_genomes_dir, fastani_path, ani_threshold=comp_ani_thresh, threads=4, status_text=status_container)
+                df_match = run_fastani_comparison(my_genomes_dir, gtdb_genomes_dir, fastani_path, ani_threshold=comp_ani_thresh, af_threshold=comp_af_thresh, threads=4, status_text=status_container)
                 
             status_container.empty()
             
@@ -728,29 +732,29 @@ with tab4:
                 only_me = my_total - len(matched_my)
                 only_gtdb = gtdb_total - len(matched_gtdb)
                 
-                st.subheader(f"Sequence Comparison Results (ANI >= {comp_ani_thresh}%)")
+                st.subheader(f"Sequence Comparison Results (ANI ≥ {comp_ani_thresh}%, AF ≥ {comp_af_thresh}%)")
                 
                 m1, m2, m3 = st.columns(3)
-                m1.metric("Common / Matched", f"{len(matched_my)} (My) / {len(matched_gtdb)} (GTDB)")
-                m2.metric("Only in My Dataset (Novel)", only_me)
-                m3.metric("Only in GTDB (Missing)", only_gtdb)
+                m1.metric("Matched Local Genomes", len(matched_my), help="Number of genomes in your dataset that found at least one match in GTDB.")
+                m2.metric("Novel Local Genomes", only_me, help="Genomes in your dataset with NO match in GTDB.")
+                m3.metric("Unmatched GTDB Genomes", only_gtdb, help="Genomes in GTDB that have NO match in your dataset.")
                 
                 c_tab1, c_tab2, c_tab3 = st.tabs(["🤝 Matched Pairs (FastANI)", "🏠 Novel in My Dataset", "🌍 Missing (Only in GTDB)"])
                 
                 with c_tab1:
-                    st.write(f"Found {len(df_match)} sequence matches crossing the threshold:")
-                    st.dataframe(df_match[['query_name', 'ref_name', 'ani', 'matches', 'total']])
+                    st.write(f"Found {len(df_match)} sequence match pairs crossing the threshold:")
+                    st.dataframe(df_match[['query_name', 'ref_name', 'ani', 'af', 'matches', 'total']])
                     
                 with c_tab2:
                     my_all = set([f for f in os.listdir(my_genomes_dir) if f.endswith(('.fna', '.fasta', '.fa'))])
                     novel_me = my_all - matched_my
-                    st.write(f"These {len(novel_me)} genomes in your dataset have no match >= {comp_ani_thresh}% ANI in the GTDB folder:")
+                    st.write(f"These {len(novel_me)} genomes in your dataset have no match (ANI ≥ {comp_ani_thresh}%, AF ≥ {comp_af_thresh}%) in the GTDB folder:")
                     st.dataframe(pd.DataFrame({"Novel_Genome_File": list(novel_me)}))
                     
                 with c_tab3:
                     gtdb_all = set([f for f in os.listdir(gtdb_genomes_dir) if f.endswith(('.fna', '.fasta', '.fa'))])
                     missing_gtdb = gtdb_all - matched_gtdb
-                    st.write(f"These {len(missing_gtdb)} genomes in the GTDB folder have no match >= {comp_ani_thresh}% ANI in your dataset:")
+                    st.write(f"These {len(missing_gtdb)} genomes in the GTDB folder have no match (ANI ≥ {comp_ani_thresh}%, AF ≥ {comp_af_thresh}%) in your dataset:")
                     st.dataframe(pd.DataFrame({"Missing_GTDB_File": list(missing_gtdb)}))
             else:
                 st.error("Comparison failed or one of the directories contained no fasta files.")
