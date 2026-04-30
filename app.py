@@ -807,161 +807,182 @@ with tab3:
                 st.error("NCBI Datasets CLI could not be installed.")
 
 with tab4:
-    st.header("Local Dataset Updater & FastANI Dereplication")
+    st.header("Local Dataset vs GTDB Species-Level Pipeline")
     st.markdown("""
-    Integrate genomes from multiple local folders, automatically run **FastANI** to identify and remove sequence-level duplicates, 
-    and compare your unique dataset directly against downloaded GTDB sequences.
+    **What are `matches` and `total`?**
+    In FastANI, genomes are conceptually divided into sequence fragments (usually 3kb long). 
+    - `matches`: The number of fragments from the query genome that successfully aligned with the reference genome.
+    - `total`: The total number of sequence fragments in the query genome.
+    - **Alignment Fraction (AF)**: Calculated as `(matches / total) * 100`. It represents the coverage of the alignment.
+    
+    **Pipeline Workflow:**
+    This one-click pipeline performs a strict species-level comparison:
+    1. **Physical Cleaning**: Deduplicates identical local files based on MD5 hashing.
+    2. **Local Dereplication**: Clusters your local genomes into **Unique Species** (Local Representatives) using FastANI & MASH.
+    3. **GTDB Auto-Fetch**: Automatically identifies and downloads the **Species Representatives** for your specified GTDB Taxon.
+    4. **Species vs Species Comparison**: Compares your Local Species against the GTDB Species to reveal overlapping and novel species.
     """)
     
-    with st.expander("Step 1: Configure Input Directories", expanded=True):
-        input_dirs_raw = st.text_area("Enter paths to local genome folders (one per line):", 
+    with st.expander("Pipeline Configuration", expanded=True):
+        input_dirs_raw = st.text_area("1. Local Genome Folders (one path per line):", 
                                      help="Example: /Users/user/genomes/bathy_v1\n/Users/user/genomes/bathy_v2")
-        output_name = st.text_input("New Dataset Name:", "Bathyarchaeia_Combined")
-        derep_ani_thresh = st.slider("Dereplication ANI Threshold (%)", min_value=80.0, max_value=100.0, value=99.0, step=0.1, help="Genomes with ANI >= this threshold will be considered identical duplicates. Default for species level is usually ~95%, for exact strains ~99%.")
-        derep_af_thresh = st.slider("Dereplication AF Threshold (%)", min_value=10.0, max_value=100.0, value=60.0, step=1.0, help="Genomes must also have an Alignment Fraction (AF) >= this threshold to be considered duplicates.")
-        threads = st.number_input("Threads to use for FastANI & MASH", min_value=1, max_value=64, value=4)
-        use_mash_derep = st.checkbox("Use MASH pre-filtering (Highly recommended for >50 genomes)", value=True, help="MASH quickly filters out dissimilar genomes, significantly speeding up the FastANI step.")
+        output_name = st.text_input("2. Dataset Name (for saving results):", "Bathyarchaeia_Species_Comparison")
         
-    if st.button("Integrate & Dereplicate"):
+        st.markdown("##### 🧬 Local Species Definition (Dereplication)")
+        col_d1, col_d2 = st.columns(2)
+        with col_d1:
+            derep_ani_thresh = st.slider("Local Species ANI Threshold (%)", min_value=80.0, max_value=100.0, value=95.0, step=0.1, help="Typically 95% for species-level clustering.")
+        with col_d2:
+            derep_af_thresh = st.slider("Local Species AF Threshold (%)", min_value=10.0, max_value=100.0, value=65.0, step=1.0, help="Typically 65% coverage for robust species definition.")
+            
+        st.markdown("##### 🌍 GTDB Target (For Comparison)")
+        col_g1, col_g2 = st.columns(2)
+        with col_g1:
+            gtdb_comp_version = st.selectbox("GTDB Version", versions, index=len(versions)-1, key="gtdb_comp_v")
+        with col_g2:
+            gtdb_comp_taxon = st.text_input("GTDB Taxon to compare against:", "c__Bathyarchaeia", key="gtdb_comp_t")
+            
+        st.markdown("##### ⚖️ Comparison Matching Rules")
+        col_c1, col_c2 = st.columns(2)
+        with col_c1:
+            comp_ani_thresh = st.slider("Comparison Match ANI Threshold (%)", min_value=80.0, max_value=100.0, value=95.0, step=0.1)
+        with col_c2:
+            comp_af_thresh = st.slider("Comparison Match AF Threshold (%)", min_value=10.0, max_value=100.0, value=65.0, step=1.0)
+            
+        st.markdown("##### ⚙️ Compute Settings")
+        col_m1, col_m2 = st.columns(2)
+        with col_m1:
+            threads = st.number_input("Threads to use for FastANI & MASH", min_value=1, max_value=64, value=4)
+        with col_m2:
+            st.markdown("<br>", unsafe_allow_html=True)
+            use_mash_pipe = st.checkbox("Use MASH pre-filtering (Highly Recommended)", value=True)
+            
+    if st.button("Run Full Species-Level Analysis"):
         input_dirs = [d.strip() for d in input_dirs_raw.split('\n') if d.strip()]
         if not input_dirs:
-            st.error("Please provide at least one input directory.")
+            st.error("Please provide at least one local input directory.")
+        elif not gtdb_comp_taxon:
+            st.error("Please specify a GTDB Taxon.")
         else:
-            combined_out = f"local_datasets/{output_name}/1_raw_combined"
-            derep_out = f"local_datasets/{output_name}/2_dereplicated_genomes"
             status_container = st.empty()
             
-            with st.spinner("Step 1: Physical Hashing and Cleaning..."):
-                report_df = clean_and_rename_genomes(input_dirs, combined_out)
+            # --- Sub-step A: Fetch GTDB Representatives ---
+            status_container.info(f"Step A: Retrieving GTDB Representatives for {gtdb_comp_taxon} (R{gtdb_comp_version})...")
+            df_gtdb = df[(df['Version'] == gtdb_comp_version) & (df['Taxonomy'].str.contains(gtdb_comp_taxon, na=False))]
+            if df_gtdb.empty:
+                st.error(f"No genomes found for {gtdb_comp_taxon} in GTDB R{gtdb_comp_version}.")
+                st.stop()
                 
-            if not report_df.empty:
-                # Install/Check FastANI & MASH
-                fastani_path = get_tool_path("fastANI")
-                mash_path = get_tool_path("mash")
-                
-                if not fastani_path or not mash_path:
-                    with st.spinner("First time setup: Installing Pixi, FastANI, and Mash..."):
-                        try:
-                            fastani_path, mash_path = install_tools_via_pixi(status_container)
-                        except Exception as e:
-                            st.error(f"Failed to install tools: {e}")
-                            st.stop()
-                            
-                with st.spinner(f"Step 2: Running dereplication (Threshold: {derep_ani_thresh}% ANI, {derep_af_thresh}% AF)..."):
-                    dup_report = run_fastani_dereplication(
-                        combined_out, derep_out, fastani_path, mash_path=mash_path, use_mash=use_mash_derep, 
-                        ani_threshold=derep_ani_thresh, af_threshold=derep_af_thresh, threads=threads, status_text=status_container
-                    )
-                
-                status_container.empty()
-                st.success(f"Integration & Dereplication complete! Unique genomes saved to: `{os.path.abspath(derep_out)}`")
-                
-                col_s1, col_s2, col_s3, col_s4 = st.columns(4)
-                total_files = report_df['Original_Count'].sum()
-                physical_unique = len(report_df)
-                physical_dups = total_files - physical_unique
-                seq_dups = len(dup_report) if not dup_report.empty else 0
-                final_unique = physical_unique - seq_dups
-                
-                col_s1.metric("Total Files Found", total_files)
-                col_s2.metric("Physical Duplicates (MD5)", physical_dups)
-                col_s3.metric("Sequence Duplicates (FastANI)", seq_dups)
-                col_s4.metric("Final Unique Genomes", final_unique)
-                
-                if not dup_report.empty:
-                    with st.expander("View FastANI Sequence Duplicates Removed"):
-                        st.dataframe(dup_report)
-                
+            df_gtdb['Is_Representative'] = 'No'
+            rep_idx = df_gtdb.drop_duplicates(subset=['Species']).index
+            df_gtdb.loc[rep_idx, 'Is_Representative'] = 'Yes'
+            reps_list = df_gtdb[df_gtdb['Is_Representative'] == 'Yes']['Genome_ID'].tolist()
+            
+            safe_name = re.sub(r'[^a-zA-Z0-9_]', '_', gtdb_comp_taxon)
+            gtdb_dir = f"ncbi_downloads/{safe_name}_R{gtdb_comp_version}_reps"
+            os.makedirs(gtdb_dir, exist_ok=True)
+            
+            downloaded = get_downloaded_accessions(gtdb_dir)
+            missing = [acc for acc in reps_list if acc.replace("RS_", "").replace("GB_", "") not in downloaded and acc not in downloaded]
+            
+            if missing:
+                status_container.info(f"Step A: Downloading {len(missing)} missing GTDB Representative Genomes via NCBI Datasets...")
+                if ensure_datasets_cli():
+                    p_bar = st.progress(0)
+                    succ, msg, s_list, f_list = download_genomes(reps_list, gtdb_dir, progress_bar=p_bar, status_text=status_container)
+                    p_bar.empty()
+                    if not succ:
+                        st.warning(msg)
+                else:
+                    st.error("NCBI Datasets CLI could not be installed.")
+                    st.stop()
             else:
+                status_container.info(f"Step A: All {len(reps_list)} GTDB Representative Genomes are already downloaded locally.")
+                
+            # --- Sub-step B: Physical Cleaning ---
+            combined_out = f"local_datasets/{output_name}/1_raw_combined"
+            derep_out = f"local_datasets/{output_name}/2_dereplicated_genomes"
+            status_container.info("Step B: Physical Hashing and Cleaning of local genomes...")
+            report_df = clean_and_rename_genomes(input_dirs, combined_out)
+            
+            if report_df.empty:
                 st.warning("No genome files (.fna, .fasta, .fa) found in the provided directories.")
-
-    st.markdown("---")
-    st.header("Step 3: Sequence Comparison vs Downloaded GTDB Data")
-    st.markdown("Compare your dereplicated dataset directly against a folder of genomes you previously downloaded from GTDB (e.g., using the Custom Download tab).")
-    
-    comp_col1, comp_col2 = st.columns(2)
-    with comp_col1:
-        my_genomes_dir = st.text_input("Path to Your Unique Genomes Folder:", f"local_datasets/Bathyarchaeia_Combined/2_dereplicated_genomes")
-    with comp_col2:
-        gtdb_genomes_dir = st.text_input("Path to GTDB Downloaded Folder:", "ncbi_downloads/c__Bathyarchaeia_R232_all")
-        
-    comp_ani_thresh = st.slider("Comparison Match ANI Threshold (%)", min_value=90.0, max_value=100.0, value=95.0, step=0.5, help="Genomes with ANI >= this threshold will be considered the same species/matched.")
-    comp_af_thresh = st.slider("Comparison Match AF Threshold (%)", min_value=10.0, max_value=100.0, value=60.0, step=1.0, help="Genomes must also have an Alignment Fraction (AF) >= this threshold to be considered matched.")
-    use_mash_comp = st.checkbox("Use MASH pre-filtering for comparison", value=True, help="Quickly identify potential matches before running precise FastANI alignment.")
-    
-    if st.button("Run Sequence Comparison"):
-        if not os.path.exists(my_genomes_dir) or not os.path.exists(gtdb_genomes_dir):
-            st.error("One or both of the provided directory paths do not exist.")
-        else:
-            status_container = st.empty()
+                st.stop()
+                
+            # --- Sub-step C: Local Dereplication ---
             fastani_path = get_tool_path("fastANI")
             mash_path = get_tool_path("mash")
             
             if not fastani_path or not mash_path:
-                with st.spinner("Installing FastANI & Mash..."):
+                with st.spinner("Installing Pixi, FastANI, and Mash..."):
                     try:
                         fastani_path, mash_path = install_tools_via_pixi(status_container)
                     except Exception as e:
                         st.error(f"Failed to install tools: {e}")
                         st.stop()
-                    
-            with st.spinner("Running Sequence Comparison... This may take a while depending on dataset size."):
-                df_match = run_fastani_comparison(
-                    my_genomes_dir, gtdb_genomes_dir, fastani_path, mash_path=mash_path, use_mash=use_mash_comp, 
-                    ani_threshold=comp_ani_thresh, af_threshold=comp_af_thresh, threads=4, status_text=status_container
-                )
-                
+                        
+            status_container.info(f"Step C: Dereplicating local genomes into Species (ANI {derep_ani_thresh}%, AF {derep_af_thresh}%)...")
+            dup_report = run_fastani_dereplication(
+                combined_out, derep_out, fastani_path, mash_path=mash_path, use_mash=use_mash_pipe, 
+                ani_threshold=derep_ani_thresh, af_threshold=derep_af_thresh, threads=threads, status_text=status_container
+            )
+            
+            # --- Sub-step D: Compare Local Species vs GTDB Species ---
+            status_container.info("Step D: Running Species vs Species Comparison...")
+            df_match = run_fastani_comparison(
+                derep_out, gtdb_dir, fastani_path, mash_path=mash_path, use_mash=use_mash_pipe, 
+                ani_threshold=comp_ani_thresh, af_threshold=comp_af_thresh, threads=threads, status_text=status_container
+            )
+            
             status_container.empty()
             
+            # --- Sub-step E: Render Results ---
             if df_match is not None:
-                my_total_files = set(os.listdir(my_genomes_dir))
-                gtdb_total_files = set(os.listdir(gtdb_genomes_dir))
+                st.success("🎉 Species-Level Analysis Complete!")
                 
-                # Exclude non-fasta files from count
-                my_total = len([f for f in my_total_files if f.endswith(('.fna', '.fasta', '.fa'))])
-                gtdb_total = len([f for f in gtdb_total_files if f.endswith(('.fna', '.fasta', '.fa'))])
+                local_reps = set([f for f in os.listdir(derep_out) if f.endswith(('.fna', '.fasta', '.fa'))])
+                gtdb_reps = set([f for f in os.listdir(gtdb_dir) if f.endswith(('.fna', '.fasta', '.fa'))])
                 
-                if df_match.empty:
-                    matched_my = set()
-                    matched_gtdb = set()
-                else:
-                    matched_my = set(df_match['query_name'])
-                    matched_gtdb = set(df_match['ref_name'])
-                    
-                only_me = my_total - len(matched_my)
-                only_gtdb = gtdb_total - len(matched_gtdb)
+                matched_local = set(df_match['query_name']) if not df_match.empty else set()
+                matched_gtdb = set(df_match['ref_name']) if not df_match.empty else set()
                 
-                st.subheader(f"Sequence Comparison Results (ANI ≥ {comp_ani_thresh}%, AF ≥ {comp_af_thresh}%)")
+                novel_local = local_reps - matched_local
+                missing_gtdb = gtdb_reps - matched_gtdb
                 
-                st.markdown("##### 🧬 Your Local Dataset (My Genomes)")
-                l1, l2, l3 = st.columns(3)
-                l1.metric("Total Local Genomes", my_total)
-                l2.metric("Matched Local Genomes", len(matched_my), help="Number of genomes in your dataset that found at least one match in GTDB.")
-                l3.metric("Novel Local Genomes", only_me, help="Genomes in your dataset with NO match in GTDB.")
+                st.markdown("### Species Comparison Summary")
+                st.markdown("This strictly compares **Unique Local Species** against **GTDB Representative Species**.")
                 
-                st.markdown("##### 🌍 GTDB Downloaded Dataset")
-                g1, g2, g3 = st.columns(3)
-                g1.metric("Total GTDB Genomes", gtdb_total)
-                g2.metric("Matched GTDB Genomes", len(matched_gtdb), help="Number of GTDB genomes that found at least one match in your dataset.")
-                g3.metric("Missing GTDB Genomes", only_gtdb, help="Genomes in GTDB that have NO match in your dataset.")
+                col_r1, col_r2, col_r3, col_r4 = st.columns(4)
+                col_r1.metric("Local Unique Species", len(local_reps))
+                col_r2.metric("GTDB Unique Species", len(gtdb_reps))
+                col_r3.metric("Shared Species (Overlap)", len(matched_local))
+                col_r4.metric("Novel Local Species", len(novel_local))
                 
-                c_tab1, c_tab2, c_tab3 = st.tabs(["🤝 Matched Pairs (FastANI)", "🏠 Novel in My Dataset", "🌍 Missing (Only in GTDB)"])
+                c_tab1, c_tab2, c_tab3, c_tab4 = st.tabs(["🏠 Novel Local Species", "🌍 Missing GTDB Species", "🤝 Shared Species", "🗑️ Local Duplicates Removed"])
                 
                 with c_tab1:
-                    st.write(f"Found {len(df_match)} sequence match pairs crossing the threshold:")
-                    st.dataframe(df_match[['query_name', 'ref_name', 'ani', 'af', 'matches', 'total']])
+                    st.write(f"**{len(novel_local)}** novel species found in your dataset that are not in GTDB R{gtdb_comp_version}:")
+                    st.dataframe(pd.DataFrame({"Novel_Local_Species_File": list(novel_local)}))
                     
                 with c_tab2:
-                    my_all = set([f for f in os.listdir(my_genomes_dir) if f.endswith(('.fna', '.fasta', '.fa'))])
-                    novel_me = my_all - matched_my
-                    st.write(f"These {len(novel_me)} genomes in your dataset have no match (ANI ≥ {comp_ani_thresh}%, AF ≥ {comp_af_thresh}%) in the GTDB folder:")
-                    st.dataframe(pd.DataFrame({"Novel_Genome_File": list(novel_me)}))
+                    st.write(f"**{len(missing_gtdb)}** species in GTDB R{gtdb_comp_version} that you haven't collected locally:")
+                    st.dataframe(pd.DataFrame({"Missing_GTDB_Species_File": list(missing_gtdb)}))
                     
                 with c_tab3:
-                    gtdb_all = set([f for f in os.listdir(gtdb_genomes_dir) if f.endswith(('.fna', '.fasta', '.fa'))])
-                    missing_gtdb = gtdb_all - matched_gtdb
-                    st.write(f"These {len(missing_gtdb)} genomes in the GTDB folder have no match (ANI ≥ {comp_ani_thresh}%, AF ≥ {comp_af_thresh}%) in your dataset:")
-                    st.dataframe(pd.DataFrame({"Missing_GTDB_File": list(missing_gtdb)}))
+                    st.write(f"**{len(df_match)}** match relationships between your local species and GTDB species:")
+                    if not df_match.empty:
+                        st.dataframe(df_match[['query_name', 'ref_name', 'ani', 'af', 'matches', 'total']])
+                    else:
+                        st.info("No overlap found.")
+                        
+                with c_tab4:
+                    st.write("These genomes were identified as duplicates and merged into their respective Local Species Representatives:")
+                    total_files = report_df['Original_Count'].sum()
+                    st.write(f"- Total Initial Files: {total_files}")
+                    st.write(f"- Exact MD5 Duplicates Removed: {total_files - len(report_df)}")
+                    st.write(f"- Sequence Duplicates Removed (ANI/AF): {len(dup_report) if not dup_report.empty else 0}")
+                    if not dup_report.empty:
+                        st.dataframe(dup_report)
             else:
                 st.error("Comparison failed or one of the directories contained no fasta files.")
 
