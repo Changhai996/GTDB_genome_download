@@ -350,8 +350,16 @@ def run_fastani_dereplication(input_dir, output_dir, fastani_path, mash_path=Non
             subprocess.run(cmd_dist, stdout=f, check=True)
             
         # 3. Parse and generate pairs for FastANI
-        df_mash = pd.read_csv(mash_dist_file, sep='\t', header=None, names=['query', 'ref', 'dist', 'pval', 'hashes'])
-        df_mash = df_mash[df_mash['query'] != df_mash['ref']]
+        # Note: MASH dist output sometimes lacks headers or may have extra fields.
+        try:
+            df_mash = pd.read_csv(mash_dist_file, sep='\t', header=None)
+            # Take only the first 5 columns to avoid issues with inconsistent trailing tabs
+            df_mash = df_mash.iloc[:, :5]
+            df_mash.columns = ['query', 'ref', 'dist', 'pval', 'hashes']
+            df_mash = df_mash[df_mash['query'] != df_mash['ref']]
+        except Exception as e:
+            st.error(f"Error parsing MASH output: {e}")
+            df_mash = pd.DataFrame()
         
         if df_mash.empty:
             # No similar pairs found at all! FastANI is not needed.
@@ -364,10 +372,13 @@ def run_fastani_dereplication(input_dir, output_dir, fastani_path, mash_path=Non
             
         # Write pairs file for FastANI
         pairs_file = os.path.join(input_dir, "fastani_pairs.txt")
-        df_mash[['query', 'ref']].to_csv(pairs_file, sep='\t', header=False, index=False)
+        # Ensure we only test each unique pair once to save time
+        df_mash['pair_id'] = df_mash.apply(lambda r: tuple(sorted([r['query'], r['ref']])), axis=1)
+        df_unique_pairs = df_mash.drop_duplicates(subset=['pair_id'])
+        df_unique_pairs[['query', 'ref']].to_csv(pairs_file, sep='\t', header=False, index=False)
         
         if status_text:
-            status_text.info(f"Step 2.2: Running FastANI on {len(df_mash)} highly similar pairs (instead of {len(genomes)*len(genomes)})...")
+            status_text.info(f"Step 2.2: Running FastANI on {len(df_unique_pairs)} highly similar pairs (instead of {len(genomes)*len(genomes)})...")
             
         cmd = [fastani_path, "--rl", pairs_file, "-o", out_file, "-t", str(threads)]
         # We don't use check=True because FastANI might return non-zero if pairs file has issues, but we still want to proceed.
@@ -475,7 +486,13 @@ def run_fastani_comparison(my_genomes_dir, gtdb_genomes_dir, fastani_path, mash_
             subprocess.run(cmd_dist, stdout=f, check=True)
             
         # Parse
-        df_mash = pd.read_csv(mash_dist_file, sep='\t', header=None, names=['ref', 'query', 'dist', 'pval', 'hashes'])
+        try:
+            df_mash = pd.read_csv(mash_dist_file, sep='\t', header=None)
+            df_mash = df_mash.iloc[:, :5]
+            df_mash.columns = ['ref', 'query', 'dist', 'pval', 'hashes']
+        except Exception as e:
+            st.error(f"Error parsing MASH comparison output: {e}")
+            df_mash = pd.DataFrame()
         
         if df_mash.empty:
             if os.path.exists(my_list): os.remove(my_list)
