@@ -280,24 +280,20 @@ def extract_accession_from_filename(name):
     match = re.search(r'(GC[AF]_\d+\.\d+)', name)
     return match.group(1) if match else None
 
-def get_fastani_path():
-    """Ensure FastANI is installed via Pixi and return its path."""
+def get_tool_path(tool_name):
+    """Ensure a tool is installed via Pixi and return its path."""
     import shutil
-    fastani = shutil.which("fastANI")
-    if fastani: return fastani
+    tool_path = shutil.which(tool_name)
+    if tool_path: return tool_path
     
-    # Check project local pixi installation
-    local_pixi = os.path.join(os.getcwd(), ".pixi", "bin", "pixi")
-    local_fastani = os.path.join(os.getcwd(), ".pixi", "envs", "default", "bin", "fastANI")
-    global_fastani = os.path.join(os.getcwd(), ".pixi", "bin", "fastANI")
-    
-    if os.path.exists(global_fastani):
-        return global_fastani
+    global_tool = os.path.join(os.getcwd(), ".pixi", "bin", tool_name)
+    if os.path.exists(global_tool):
+        return global_tool
         
     return None
 
-def install_fastani(status_container):
-    """Installs FastANI via Pixi in the background."""
+def install_tools_via_pixi(status_container):
+    """Installs required tools (FastANI, Mash) via Pixi in the background."""
     pixi_home = os.path.join(os.getcwd(), ".pixi")
     os.environ["PIXI_HOME"] = pixi_home
     pixi_bin = os.path.join(pixi_home, "bin", "pixi")
@@ -307,16 +303,16 @@ def install_fastani(status_container):
         cmd_install_pixi = f"export PIXI_HOME={pixi_home} && curl -fsSL https://pixi.sh/install.sh | bash"
         subprocess.run(cmd_install_pixi, shell=True, check=True, capture_output=True)
         
-    status_container.info("Installing FastANI via Pixi...")
-    cmd_install_fastani = f"export PIXI_HOME={pixi_home} && {pixi_bin} global install fastani -c bioconda -c conda-forge"
-    subprocess.run(cmd_install_fastani, shell=True, check=True, capture_output=True)
+    status_container.info("Installing FastANI and Mash via Pixi...")
+    cmd_install_tools = f"export PIXI_HOME={pixi_home} && {pixi_bin} global install fastani mash -c bioconda -c conda-forge"
+    subprocess.run(cmd_install_tools, shell=True, check=True, capture_output=True)
     
-    return os.path.join(pixi_home, "bin", "fastANI")
+    return os.path.join(pixi_home, "bin", "fastANI"), os.path.join(pixi_home, "bin", "mash")
 
-def run_fastani_dereplication(input_dir, output_dir, fastani_path, ani_threshold=99.9, af_threshold=60.0, threads=4, status_text=None):
+def run_fastani_dereplication(input_dir, output_dir, fastani_path, mash_path=None, use_mash=True, ani_threshold=99.9, af_threshold=60.0, threads=4, status_text=None):
     """
-    Run FastANI all-vs-all to identify sequence-level duplicates.
-    Keep one representative per cluster and move to output_dir.
+    Run FastANI to identify sequence-level duplicates.
+    If use_mash is True, uses MASH to pre-filter highly similar genome pairs to speed up FastANI.
     """
     if os.path.exists(output_dir):
         shutil.rmtree(output_dir)
@@ -332,13 +328,60 @@ def run_fastani_dereplication(input_dir, output_dir, fastani_path, ani_threshold
     with open(list_file, "w") as f:
         f.write("\n".join(genomes))
         
-    out_file = os.path.join(input_dir, "fastani_all_vs_all.out")
+    out_file = os.path.join(input_dir, "fastani_out.txt")
     
-    if status_text:
-        status_text.info(f"Running FastANI all-vs-all on {len(genomes)} genomes... This might take a few minutes.")
+    if use_mash and mash_path:
+        if status_text:
+            status_text.info(f"Step 2.1: Running MASH pre-filtering on {len(genomes)} genomes...")
+            
+        msh_file = os.path.join(input_dir, "genomes.msh")
+        mash_dist_file = os.path.join(input_dir, "mash_dist.txt")
         
-    cmd = [fastani_path, "--ql", list_file, "--rl", list_file, "-o", out_file, "-t", str(threads)]
-    subprocess.run(cmd, check=True, capture_output=True)
+        # 1. Sketch
+        cmd_sketch = [mash_path, "sketch", "-l", list_file, "-o", msh_file, "-p", str(threads)]
+        subprocess.run(cmd_sketch, check=True, capture_output=True)
+        
+        # 2. Dist
+        # MASH distance = 1 - ANI. So distance 0.1 means ~90% ANI.
+        # We set threshold loosely (e.g. max dist 0.1) to catch everything that MIGHT pass the FastANI threshold.
+        max_dist = 1.0 - (ani_threshold / 100.0) + 0.05 # Add 5% buffer
+        cmd_dist = [mash_path, "dist", "-d", str(max_dist), "-p", str(threads), msh_file, msh_file]
+        with open(mash_dist_file, "w") as f:
+            subprocess.run(cmd_dist, stdout=f, check=True)
+            
+        # 3. Parse and generate pairs for FastANI
+        df_mash = pd.read_csv(mash_dist_file, sep='\t', header=None, names=['query', 'ref', 'dist', 'pval', 'hashes'])
+        df_mash = df_mash[df_mash['query'] != df_mash['ref']]
+        
+        if df_mash.empty:
+            # No similar pairs found at all! FastANI is not needed.
+            for g in genomes:
+                shutil.copy2(g, os.path.join(output_dir, os.path.basename(g)))
+            if os.path.exists(list_file): os.remove(list_file)
+            if os.path.exists(msh_file): os.remove(msh_file)
+            if os.path.exists(mash_dist_file): os.remove(mash_dist_file)
+            return pd.DataFrame()
+            
+        # Write pairs file for FastANI
+        pairs_file = os.path.join(input_dir, "fastani_pairs.txt")
+        df_mash[['query', 'ref']].to_csv(pairs_file, sep='\t', header=False, index=False)
+        
+        if status_text:
+            status_text.info(f"Step 2.2: Running FastANI on {len(df_mash)} highly similar pairs (instead of {len(genomes)*len(genomes)})...")
+            
+        cmd = [fastani_path, "--rl", pairs_file, "-o", out_file, "-t", str(threads)]
+        # We don't use check=True because FastANI might return non-zero if pairs file has issues, but we still want to proceed.
+        subprocess.run(cmd, capture_output=True)
+        
+        if os.path.exists(msh_file): os.remove(msh_file)
+        if os.path.exists(mash_dist_file): os.remove(mash_dist_file)
+        if os.path.exists(pairs_file): os.remove(pairs_file)
+        
+    else:
+        if status_text:
+            status_text.info(f"Running FastANI all-vs-all on {len(genomes)} genomes... This might take a while.")
+        cmd = [fastani_path, "--ql", list_file, "--rl", list_file, "-o", out_file, "-t", str(threads)]
+        subprocess.run(cmd, check=True, capture_output=True)
     
     # Parse FastANI output
     # Format: query, ref, ANI, matches, total
@@ -394,9 +437,10 @@ def run_fastani_dereplication(input_dir, output_dir, fastani_path, ani_threshold
         return pd.DataFrame(report)
     return pd.DataFrame()
 
-def run_fastani_comparison(my_genomes_dir, gtdb_genomes_dir, fastani_path, ani_threshold=95.0, af_threshold=60.0, threads=4, status_text=None):
+def run_fastani_comparison(my_genomes_dir, gtdb_genomes_dir, fastani_path, mash_path=None, use_mash=True, ani_threshold=95.0, af_threshold=60.0, threads=4, status_text=None):
     """
     Compare user dataset vs GTDB downloaded dataset.
+    If use_mash is True, uses MASH to pre-filter to only compute FastANI on pairs with similar distance.
     """
     my_genomes = [os.path.join(my_genomes_dir, f) for f in os.listdir(my_genomes_dir) if f.endswith(('.fna', '.fasta', '.fa'))]
     gtdb_genomes = [os.path.join(gtdb_genomes_dir, f) for f in os.listdir(gtdb_genomes_dir) if f.endswith(('.fna', '.fasta', '.fa'))]
@@ -412,11 +456,54 @@ def run_fastani_comparison(my_genomes_dir, gtdb_genomes_dir, fastani_path, ani_t
         
     out_file = os.path.join(my_genomes_dir, "fastani_vs_gtdb.out")
     
-    if status_text:
-        status_text.info(f"Running FastANI comparison: {len(my_genomes)} My Genomes VS {len(gtdb_genomes)} GTDB Genomes...")
+    if use_mash and mash_path:
+        if status_text:
+            status_text.info(f"Running MASH pre-filtering: {len(my_genomes)} My Genomes VS {len(gtdb_genomes)} GTDB Genomes...")
+            
+        my_msh = os.path.join(my_genomes_dir, "my.msh")
+        gtdb_msh = os.path.join(gtdb_genomes_dir, "gtdb.msh")
+        mash_dist_file = os.path.join(my_genomes_dir, "mash_vs_gtdb.txt")
         
-    cmd = [fastani_path, "--ql", my_list, "--rl", gtdb_list, "-o", out_file, "-t", str(threads)]
-    subprocess.run(cmd, check=True, capture_output=True)
+        # Sketch both
+        subprocess.run([mash_path, "sketch", "-l", my_list, "-o", my_msh, "-p", str(threads)], check=True, capture_output=True)
+        subprocess.run([mash_path, "sketch", "-l", gtdb_list, "-o", gtdb_msh, "-p", str(threads)], check=True, capture_output=True)
+        
+        # Dist
+        max_dist = 1.0 - (ani_threshold / 100.0) + 0.05
+        cmd_dist = [mash_path, "dist", "-d", str(max_dist), "-p", str(threads), gtdb_msh, my_msh]
+        with open(mash_dist_file, "w") as f:
+            subprocess.run(cmd_dist, stdout=f, check=True)
+            
+        # Parse
+        df_mash = pd.read_csv(mash_dist_file, sep='\t', header=None, names=['ref', 'query', 'dist', 'pval', 'hashes'])
+        
+        if df_mash.empty:
+            if os.path.exists(my_list): os.remove(my_list)
+            if os.path.exists(gtdb_list): os.remove(gtdb_list)
+            if os.path.exists(my_msh): os.remove(my_msh)
+            if os.path.exists(gtdb_msh): os.remove(gtdb_msh)
+            if os.path.exists(mash_dist_file): os.remove(mash_dist_file)
+            return pd.DataFrame()
+            
+        pairs_file = os.path.join(my_genomes_dir, "fastani_gtdb_pairs.txt")
+        df_mash[['query', 'ref']].to_csv(pairs_file, sep='\t', header=False, index=False)
+        
+        if status_text:
+            status_text.info(f"Running FastANI on {len(df_mash)} pre-filtered candidate pairs...")
+        
+        cmd = [fastani_path, "--rl", pairs_file, "-o", out_file, "-t", str(threads)]
+        subprocess.run(cmd, capture_output=True)
+        
+        if os.path.exists(my_msh): os.remove(my_msh)
+        if os.path.exists(gtdb_msh): os.remove(gtdb_msh)
+        if os.path.exists(mash_dist_file): os.remove(mash_dist_file)
+        if os.path.exists(pairs_file): os.remove(pairs_file)
+        
+    else:
+        if status_text:
+            status_text.info(f"Running FastANI comparison: {len(my_genomes)} My Genomes VS {len(gtdb_genomes)} GTDB Genomes...")
+        cmd = [fastani_path, "--ql", my_list, "--rl", gtdb_list, "-o", out_file, "-t", str(threads)]
+        subprocess.run(cmd, check=True, capture_output=True)
     
     if os.path.exists(out_file):
         try:
@@ -722,7 +809,8 @@ with tab4:
         output_name = st.text_input("New Dataset Name:", "Bathyarchaeia_Combined")
         derep_ani_thresh = st.slider("Dereplication ANI Threshold (%)", min_value=99.0, max_value=100.0, value=99.9, step=0.1, help="Genomes with ANI >= this threshold will be considered identical duplicates.")
         derep_af_thresh = st.slider("Dereplication AF Threshold (%)", min_value=10.0, max_value=100.0, value=60.0, step=1.0, help="Genomes must also have an Alignment Fraction (AF) >= this threshold to be considered duplicates.")
-        threads = st.number_input("Threads to use for FastANI", min_value=1, max_value=64, value=4)
+        threads = st.number_input("Threads to use for FastANI & MASH", min_value=1, max_value=64, value=4)
+        use_mash_derep = st.checkbox("Use MASH pre-filtering (Highly recommended for >50 genomes)", value=True, help="MASH quickly filters out dissimilar genomes, significantly speeding up the FastANI step.")
         
     if st.button("Integrate & Dereplicate"):
         input_dirs = [d.strip() for d in input_dirs_raw.split('\n') if d.strip()]
@@ -737,18 +825,23 @@ with tab4:
                 report_df = clean_and_rename_genomes(input_dirs, combined_out)
                 
             if not report_df.empty:
-                # Install/Check FastANI
-                fastani_path = get_fastani_path()
-                if not fastani_path:
-                    with st.spinner("First time setup: Installing Pixi and FastANI..."):
+                # Install/Check FastANI & MASH
+                fastani_path = get_tool_path("fastANI")
+                mash_path = get_tool_path("mash")
+                
+                if not fastani_path or not mash_path:
+                    with st.spinner("First time setup: Installing Pixi, FastANI, and Mash..."):
                         try:
-                            fastani_path = install_fastani(status_container)
+                            fastani_path, mash_path = install_tools_via_pixi(status_container)
                         except Exception as e:
-                            st.error(f"Failed to install FastANI: {e}")
+                            st.error(f"Failed to install tools: {e}")
                             st.stop()
                             
-                with st.spinner(f"Step 2: Running FastANI all-vs-all dereplication (Threshold: {derep_ani_thresh}% ANI, {derep_af_thresh}% AF)..."):
-                    dup_report = run_fastani_dereplication(combined_out, derep_out, fastani_path, ani_threshold=derep_ani_thresh, af_threshold=derep_af_thresh, threads=threads, status_text=status_container)
+                with st.spinner(f"Step 2: Running dereplication (Threshold: {derep_ani_thresh}% ANI, {derep_af_thresh}% AF)..."):
+                    dup_report = run_fastani_dereplication(
+                        combined_out, derep_out, fastani_path, mash_path=mash_path, use_mash=use_mash_derep, 
+                        ani_threshold=derep_ani_thresh, af_threshold=derep_af_thresh, threads=threads, status_text=status_container
+                    )
                 
                 status_container.empty()
                 st.success(f"Integration & Dereplication complete! Unique genomes saved to: `{os.path.abspath(derep_out)}`")
@@ -784,19 +877,29 @@ with tab4:
         
     comp_ani_thresh = st.slider("Comparison Match ANI Threshold (%)", min_value=90.0, max_value=100.0, value=95.0, step=0.5, help="Genomes with ANI >= this threshold will be considered the same species/matched.")
     comp_af_thresh = st.slider("Comparison Match AF Threshold (%)", min_value=10.0, max_value=100.0, value=60.0, step=1.0, help="Genomes must also have an Alignment Fraction (AF) >= this threshold to be considered matched.")
+    use_mash_comp = st.checkbox("Use MASH pre-filtering for comparison", value=True, help="Quickly identify potential matches before running precise FastANI alignment.")
     
     if st.button("Run Sequence Comparison"):
         if not os.path.exists(my_genomes_dir) or not os.path.exists(gtdb_genomes_dir):
             st.error("One or both of the provided directory paths do not exist.")
         else:
             status_container = st.empty()
-            fastani_path = get_fastani_path()
-            if not fastani_path:
-                with st.spinner("Installing FastANI..."):
-                    fastani_path = install_fastani(status_container)
+            fastani_path = get_tool_path("fastANI")
+            mash_path = get_tool_path("mash")
+            
+            if not fastani_path or not mash_path:
+                with st.spinner("Installing FastANI & Mash..."):
+                    try:
+                        fastani_path, mash_path = install_tools_via_pixi(status_container)
+                    except Exception as e:
+                        st.error(f"Failed to install tools: {e}")
+                        st.stop()
                     
-            with st.spinner("Running FastANI Comparison... This may take a while depending on dataset size."):
-                df_match = run_fastani_comparison(my_genomes_dir, gtdb_genomes_dir, fastani_path, ani_threshold=comp_ani_thresh, af_threshold=comp_af_thresh, threads=4, status_text=status_container)
+            with st.spinner("Running Sequence Comparison... This may take a while depending on dataset size."):
+                df_match = run_fastani_comparison(
+                    my_genomes_dir, gtdb_genomes_dir, fastani_path, mash_path=mash_path, use_mash=use_mash_comp, 
+                    ani_threshold=comp_ani_thresh, af_threshold=comp_af_thresh, threads=4, status_text=status_container
+                )
                 
             status_container.empty()
             
