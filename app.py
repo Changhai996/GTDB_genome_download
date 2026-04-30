@@ -807,7 +807,7 @@ with tab4:
         input_dirs_raw = st.text_area("Enter paths to local genome folders (one per line):", 
                                      help="Example: /Users/user/genomes/bathy_v1\n/Users/user/genomes/bathy_v2")
         output_name = st.text_input("New Dataset Name:", "Bathyarchaeia_Combined")
-        derep_ani_thresh = st.slider("Dereplication ANI Threshold (%)", min_value=99.0, max_value=100.0, value=99.9, step=0.1, help="Genomes with ANI >= this threshold will be considered identical duplicates.")
+        derep_ani_thresh = st.slider("Dereplication ANI Threshold (%)", min_value=80.0, max_value=100.0, value=99.0, step=0.1, help="Genomes with ANI >= this threshold will be considered identical duplicates. Default for species level is usually ~95%, for exact strains ~99%.")
         derep_af_thresh = st.slider("Dereplication AF Threshold (%)", min_value=10.0, max_value=100.0, value=60.0, step=1.0, help="Genomes must also have an Alignment Fraction (AF) >= this threshold to be considered duplicates.")
         threads = st.number_input("Threads to use for FastANI & MASH", min_value=1, max_value=64, value=4)
         use_mash_derep = st.checkbox("Use MASH pre-filtering (Highly recommended for >50 genomes)", value=True, help="MASH quickly filters out dissimilar genomes, significantly speeding up the FastANI step.")
