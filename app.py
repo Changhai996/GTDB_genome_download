@@ -459,7 +459,8 @@ with tab1:
     search_single = st.text_input("Enter a taxonomic group to search (e.g., c__Bathyarchaeia):", "c__Bathyarchaeia", key="search_single")
     if search_single:
         df_res = df_single[df_single['Taxonomy'].str.contains(search_single, na=False)]
-        st.write(f"Found **{len(df_res)}** genomes matching `{search_single}`.")
+        rep_count = df_res['Species'].nunique()
+        st.markdown(f"**Found {len(df_res)} total genomes** and **{rep_count} representative genomes (unique species)** matching `{search_single}`.")
         st.dataframe(df_res[['Genome_ID', 'Taxonomy']])
         
         if st.button("Download these genomes via NCBI Datasets", key="btn_single_dl"):
@@ -494,10 +495,19 @@ with tab2:
             df_v1 = df[(df['Version'] == v1) & (df['Taxonomy'].str.contains(search_term, na=False))]
             df_v2 = df[(df['Version'] == v2) & (df['Taxonomy'].str.contains(search_term, na=False))]
             
+            st.markdown("##### 🧬 Total Genomes")
             col1, col2, col3 = st.columns(3)
             col1.metric("Genomes in R" + str(v1), len(df_v1))
             col2.metric("Genomes in R" + str(v2), len(df_v2))
             col3.metric("Net Change", len(df_v2) - len(df_v1))
+            
+            st.markdown("##### 👑 Representative Genomes (Unique Species)")
+            rep_v1 = df_v1['Species'].nunique()
+            rep_v2 = df_v2['Species'].nunique()
+            col4, col5, col6 = st.columns(3)
+            col4.metric("Reps in R" + str(v1), rep_v1)
+            col5.metric("Reps in R" + str(v2), rep_v2)
+            col6.metric("Rep Net Change", rep_v2 - rep_v1)
             
             genomes_v1 = set(df_v1['Genome_ID'])
             genomes_v2 = set(df_v2['Genome_ID'])
