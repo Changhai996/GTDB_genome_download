@@ -458,24 +458,52 @@ with tab1:
     
     search_single = st.text_input("Enter a taxonomic group to search (e.g., c__Bathyarchaeia):", "c__Bathyarchaeia", key="search_single")
     if search_single:
-        df_res = df_single[df_single['Taxonomy'].str.contains(search_single, na=False)]
+        df_res = df_single[df_single['Taxonomy'].str.contains(search_single, na=False)].copy()
         rep_count = df_res['Species'].nunique()
         st.markdown(f"**Found {len(df_res)} total genomes** and **{rep_count} representative genomes (unique species)** matching `{search_single}`.")
-        st.dataframe(df_res[['Genome_ID', 'Taxonomy']])
         
-        if st.button("Download these genomes via NCBI Datasets", key="btn_single_dl"):
-            if ensure_datasets_cli():
-                st_cont = st.empty()
-                p_bar = st.progress(0)
-                safe_name = re.sub(r'[^a-zA-Z0-9_]', '_', search_single)
-                out_dir = f"ncbi_downloads/{safe_name}_R{sel_version}"
-                succ, msg, s_list, f_list = download_genomes(df_res['Genome_ID'].tolist(), out_dir, progress_bar=p_bar, status_text=st_cont)
-                if succ:
-                    st_cont.success(msg)
+        # Mark one representative per species
+        df_res['Is_Representative'] = 'No'
+        rep_idx = df_res.drop_duplicates(subset=['Species']).index
+        df_res.loc[rep_idx, 'Is_Representative'] = 'Yes'
+        
+        st.info("Note: Since we only load taxonomy data, one genome per unique species is automatically marked as the representative.")
+        
+        def highlight_reps(row):
+            return ['background-color: rgba(40, 167, 69, 0.2)'] * len(row) if row['Is_Representative'] == 'Yes' else [''] * len(row)
+            
+        st.dataframe(df_res[['Genome_ID', 'Is_Representative', 'Taxonomy']].style.apply(highlight_reps, axis=1))
+        
+        col_dl1, col_dl2 = st.columns(2)
+        with col_dl1:
+            if st.button("Download ALL genomes via NCBI Datasets", key="btn_single_dl_all"):
+                if ensure_datasets_cli():
+                    st_cont = st.empty()
+                    p_bar = st.progress(0)
+                    safe_name = re.sub(r'[^a-zA-Z0-9_]', '_', search_single)
+                    out_dir = f"ncbi_downloads/{safe_name}_R{sel_version}_all"
+                    succ, msg, s_list, f_list = download_genomes(df_res['Genome_ID'].tolist(), out_dir, progress_bar=p_bar, status_text=st_cont)
+                    if succ:
+                        st_cont.success(msg)
+                    else:
+                        st_cont.warning(msg)
                 else:
-                    st_cont.warning(msg)
-            else:
-                st.error("NCBI Datasets CLI could not be installed.")
+                    st.error("NCBI Datasets CLI could not be installed.")
+        with col_dl2:
+            if st.button("Download ONLY Representatives via NCBI Datasets", key="btn_single_dl_reps"):
+                if ensure_datasets_cli():
+                    st_cont = st.empty()
+                    p_bar = st.progress(0)
+                    safe_name = re.sub(r'[^a-zA-Z0-9_]', '_', search_single)
+                    out_dir = f"ncbi_downloads/{safe_name}_R{sel_version}_reps"
+                    reps_list = df_res[df_res['Is_Representative'] == 'Yes']['Genome_ID'].tolist()
+                    succ, msg, s_list, f_list = download_genomes(reps_list, out_dir, progress_bar=p_bar, status_text=st_cont)
+                    if succ:
+                        st_cont.success(msg)
+                    else:
+                        st_cont.warning(msg)
+                else:
+                    st.error("NCBI Datasets CLI could not be installed.")
 
 with tab2:
     st.header("Version Comparison")
@@ -555,9 +583,9 @@ with tab2:
                     st.info("No taxonomy updates found for retained genomes.")
             # --- End of Detailed Comparison Section ---
 
-            dl_col1, dl_col2 = st.columns(2)
+            dl_col1, dl_col2, dl_col3, dl_col4 = st.columns(4)
             with dl_col1:
-                if st.button(f"Download ALL ({len(df_v2)}) in R{v2}", key="dl_all"):
+                if st.button(f"Download ALL Genomes ({len(df_v2)}) in R{v2}", key="dl_all"):
                     if ensure_datasets_cli():
                         st_cont = st.empty()
                         p_bar = st.progress(0)
@@ -568,8 +596,10 @@ with tab2:
                             st_cont.success(msg)
                         else:
                             st_cont.warning(msg)
+                    else:
+                        st.error("NCBI Datasets CLI could not be installed.")
             with dl_col2:
-                if len(new_genomes) > 0 and st.button(f"Download NEW ({len(new_genomes)}) in R{v2}", key="dl_new"):
+                if len(new_genomes) > 0 and st.button(f"Download NEW Genomes ({len(new_genomes)}) in R{v2}", key="dl_new"):
                     if ensure_datasets_cli():
                         st_cont = st.empty()
                         p_bar = st.progress(0)
@@ -580,6 +610,39 @@ with tab2:
                             st_cont.success(msg)
                         else:
                             st_cont.warning(msg)
+                    else:
+                        st.error("NCBI Datasets CLI could not be installed.")
+            with dl_col3:
+                reps_v2 = df_v2.drop_duplicates(subset=['Species'])['Genome_ID'].tolist()
+                if st.button(f"Download ALL Reps ({len(reps_v2)}) in R{v2}", key="dl_all_reps"):
+                    if ensure_datasets_cli():
+                        st_cont = st.empty()
+                        p_bar = st.progress(0)
+                        safe_name = re.sub(r'[^a-zA-Z0-9_]', '_', search_term)
+                        out_dir = f"ncbi_downloads/{safe_name}_R{v2}_all_reps"
+                        succ, msg, s_list, f_list = download_genomes(reps_v2, out_dir, progress_bar=p_bar, status_text=st_cont)
+                        if succ:
+                            st_cont.success(msg)
+                        else:
+                            st_cont.warning(msg)
+                    else:
+                        st.error("NCBI Datasets CLI could not be installed.")
+            with dl_col4:
+                new_species = set(df_v2['Species']) - set(df_v1['Species'])
+                new_reps = df_v2[df_v2['Species'].isin(new_species)].drop_duplicates(subset=['Species'])['Genome_ID'].tolist()
+                if len(new_reps) > 0 and st.button(f"Download NEW Reps ({len(new_reps)}) in R{v2}", key="dl_new_reps"):
+                    if ensure_datasets_cli():
+                        st_cont = st.empty()
+                        p_bar = st.progress(0)
+                        safe_name = re.sub(r'[^a-zA-Z0-9_]', '_', search_term)
+                        out_dir = f"ncbi_downloads/{safe_name}_R{v2}_new_reps"
+                        succ, msg, s_list, f_list = download_genomes(new_reps, out_dir, progress_bar=p_bar, status_text=st_cont)
+                        if succ:
+                            st_cont.success(msg)
+                        else:
+                            st_cont.warning(msg)
+                    else:
+                        st.error("NCBI Datasets CLI could not be installed.")
 
 with tab3:
     st.header("Custom Download & Email Report")
