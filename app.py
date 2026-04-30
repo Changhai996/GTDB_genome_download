@@ -747,10 +747,17 @@ with tab4:
                 
                 st.subheader(f"Sequence Comparison Results (ANI ≥ {comp_ani_thresh}%, AF ≥ {comp_af_thresh}%)")
                 
-                m1, m2, m3 = st.columns(3)
-                m1.metric("Matched Local Genomes", len(matched_my), help="Number of genomes in your dataset that found at least one match in GTDB.")
-                m2.metric("Novel Local Genomes", only_me, help="Genomes in your dataset with NO match in GTDB.")
-                m3.metric("Unmatched GTDB Genomes", only_gtdb, help="Genomes in GTDB that have NO match in your dataset.")
+                st.markdown("##### 🧬 Your Local Dataset (My Genomes)")
+                l1, l2, l3 = st.columns(3)
+                l1.metric("Total Local Genomes", my_total)
+                l2.metric("Matched Local Genomes", len(matched_my), help="Number of genomes in your dataset that found at least one match in GTDB.")
+                l3.metric("Novel Local Genomes", only_me, help="Genomes in your dataset with NO match in GTDB.")
+                
+                st.markdown("##### 🌍 GTDB Downloaded Dataset")
+                g1, g2, g3 = st.columns(3)
+                g1.metric("Total GTDB Genomes", gtdb_total)
+                g2.metric("Matched GTDB Genomes", len(matched_gtdb), help="Number of GTDB genomes that found at least one match in your dataset.")
+                g3.metric("Missing GTDB Genomes", only_gtdb, help="Genomes in GTDB that have NO match in your dataset.")
                 
                 c_tab1, c_tab2, c_tab3 = st.tabs(["🤝 Matched Pairs (FastANI)", "🏠 Novel in My Dataset", "🌍 Missing (Only in GTDB)"])
                 
