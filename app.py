@@ -370,23 +370,63 @@ def run_fastani_dereplication(input_dir, output_dir, fastani_path, mash_path=Non
             if os.path.exists(mash_dist_file): os.remove(mash_dist_file)
             return pd.DataFrame()
             
-        # Write pairs file for FastANI
-        pairs_file = os.path.join(input_dir, "fastani_pairs.txt")
-        # Ensure we only test each unique pair once to save time
-        df_mash['pair_id'] = df_mash.apply(lambda r: tuple(sorted([r['query'], r['ref']])), axis=1)
-        df_unique_pairs = df_mash.drop_duplicates(subset=['pair_id'])
-        df_unique_pairs[['query', 'ref']].to_csv(pairs_file, sep='\t', header=False, index=False)
+        # Build connected components from MASH to run FastANI on each cluster
+        parent = {}
+        def find(i):
+            if parent[i] == i: return i
+            parent[i] = find(parent[i])
+            return parent[i]
+        def union(i, j):
+            root_i = find(i)
+            root_j = find(j)
+            if root_i != root_j:
+                parent[root_i] = root_j
+                
+        for g in genomes:
+            parent[g] = g
+            
+        for _, row in df_mash.iterrows():
+            if row['query'] in parent and row['ref'] in parent:
+                union(row['query'], row['ref'])
+                
+        cluster_map = {}
+        for g in genomes:
+            root = find(g)
+            if root not in cluster_map:
+                cluster_map[root] = []
+            cluster_map[root].append(g)
+            
+        components = list(cluster_map.values())
         
         if status_text:
-            status_text.info(f"Step 2.2: Running FastANI on {len(df_unique_pairs)} highly similar pairs (instead of {len(genomes)*len(genomes)})...")
+            status_text.info(f"Step 2.2: Found {len(components)} primary clusters. Running FastANI precision check...")
             
-        cmd = [fastani_path, "--rl", pairs_file, "-o", out_file, "-t", str(threads)]
-        # We don't use check=True because FastANI might return non-zero if pairs file has issues, but we still want to proceed.
-        subprocess.run(cmd, capture_output=True)
-        
+        df_ani_list = []
+        for i, comp in enumerate(components):
+            if len(comp) > 1:
+                comp_list_file = os.path.join(input_dir, f"comp_{i}_list.txt")
+                comp_out_file = os.path.join(input_dir, f"comp_{i}_out.txt")
+                with open(comp_list_file, "w") as f:
+                    f.write("\n".join(comp))
+                
+                cmd = [fastani_path, "--ql", comp_list_file, "--rl", comp_list_file, "-o", comp_out_file, "-t", str(threads)]
+                subprocess.run(cmd, capture_output=True)
+                
+                if os.path.exists(comp_out_file):
+                    try:
+                        df_comp = pd.read_csv(comp_out_file, sep='\t', header=None, names=['query', 'ref', 'ani', 'matches', 'total'])
+                        df_ani_list.append(df_comp)
+                    except Exception:
+                        pass
+                    os.remove(comp_out_file)
+                if os.path.exists(comp_list_file): os.remove(comp_list_file)
+                
+        if df_ani_list:
+            df_ani_full = pd.concat(df_ani_list, ignore_index=True)
+            df_ani_full.to_csv(out_file, sep='\t', header=False, index=False)
+            
         if os.path.exists(msh_file): os.remove(msh_file)
         if os.path.exists(mash_dist_file): os.remove(mash_dist_file)
-        if os.path.exists(pairs_file): os.remove(pairs_file)
         
     else:
         if status_text:
@@ -502,19 +542,28 @@ def run_fastani_comparison(my_genomes_dir, gtdb_genomes_dir, fastani_path, mash_
             if os.path.exists(mash_dist_file): os.remove(mash_dist_file)
             return pd.DataFrame()
             
-        pairs_file = os.path.join(my_genomes_dir, "fastani_gtdb_pairs.txt")
-        df_mash[['query', 'ref']].to_csv(pairs_file, sep='\t', header=False, index=False)
+        unique_queries = df_mash['query'].unique()
+        unique_refs = df_mash['ref'].unique()
         
+        filtered_my_list = os.path.join(my_genomes_dir, "my_query_filtered_list.txt")
+        filtered_gtdb_list = os.path.join(gtdb_genomes_dir, "gtdb_ref_filtered_list.txt")
+        
+        with open(filtered_my_list, "w") as f:
+            f.write("\n".join(unique_queries))
+        with open(filtered_gtdb_list, "w") as f:
+            f.write("\n".join(unique_refs))
+            
         if status_text:
-            status_text.info(f"Running FastANI on {len(df_mash)} pre-filtered candidate pairs...")
+            status_text.info(f"Running FastANI on {len(unique_queries)} vs {len(unique_refs)} pre-filtered genomes...")
         
-        cmd = [fastani_path, "--rl", pairs_file, "-o", out_file, "-t", str(threads)]
+        cmd = [fastani_path, "--ql", filtered_my_list, "--rl", filtered_gtdb_list, "-o", out_file, "-t", str(threads)]
         subprocess.run(cmd, capture_output=True)
         
         if os.path.exists(my_msh): os.remove(my_msh)
         if os.path.exists(gtdb_msh): os.remove(gtdb_msh)
         if os.path.exists(mash_dist_file): os.remove(mash_dist_file)
-        if os.path.exists(pairs_file): os.remove(pairs_file)
+        if os.path.exists(filtered_my_list): os.remove(filtered_my_list)
+        if os.path.exists(filtered_gtdb_list): os.remove(filtered_gtdb_list)
         
     else:
         if status_text:
