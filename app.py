@@ -75,34 +75,6 @@ def get_downloaded_accessions(output_dir):
                 downloaded.add(match.group(1))
     return downloaded
 
-def send_email_report(sender_email, sender_pwd, smtp_server, smtp_port, receiver_email, report_file, summary_text):
-    msg = MIMEMultipart()
-    msg['Subject'] = 'NCBI Datasets Download Report'
-    msg['From'] = sender_email
-    msg['To'] = receiver_email
-    
-    msg.attach(MIMEText(summary_text, 'plain'))
-    
-    if os.path.exists(report_file):
-        with open(report_file, 'rb') as f:
-            part = MIMEApplication(f.read(), Name=os.path.basename(report_file))
-            part['Content-Disposition'] = f'attachment; filename="{os.path.basename(report_file)}"'
-            msg.attach(part)
-        
-    try:
-        if smtp_port == 465:
-            with smtplib.SMTP_SSL(smtp_server, smtp_port) as server:
-                server.login(sender_email, sender_pwd)
-                server.send_message(msg)
-        else:
-            with smtplib.SMTP(smtp_server, smtp_port) as server:
-                server.starttls()
-                server.login(sender_email, sender_pwd)
-                server.send_message(msg)
-        return True, "Email sent successfully."
-    except Exception as e:
-        return False, f"Failed to send email: {e}"
-
 def download_genomes(genome_list, output_dir, zip_name="dataset.zip", progress_bar=None, status_text=None, batch_size=20):
     if not genome_list:
         return False, "No genomes to download.", [], []
@@ -599,7 +571,7 @@ if df.empty:
 
 versions = sorted(df['Version'].unique())
 
-tab1, tab2, tab3, tab4 = st.tabs(["🔍 Single Version Explorer", "📊 Version Comparison", "📥 Custom Download & Email", "📦 Dataset Updater"])
+tab1, tab2, tab3, tab4 = st.tabs(["🔍 Single Version Explorer", "📊 Version Comparison", "📥 Custom Download", "📦 Dataset Updater"])
 
 with tab1:
     st.header("Single Version Explorer")
@@ -798,30 +770,15 @@ with tab2:
                         st.error("NCBI Datasets CLI could not be installed.")
 
 with tab3:
-    st.header("Custom Download & Email Report")
-    st.markdown("Enter custom Genome IDs to download, and automatically send a report to your email.")
+    st.header("Custom Download")
+    st.markdown("Enter custom Genome IDs to download them directly via NCBI Datasets.")
     
     custom_ids_text = st.text_area("Enter Genome IDs (one per line, e.g., GCF_000000000.1, RS_GCF_000979855.1):")
     
-    st.subheader("Email Configuration")
-    st.info("To send an email, please provide a valid sender email and its SMTP password/authorization code.")
-    
-    col_em1, col_em2 = st.columns(2)
-    with col_em1:
-        sender_email = st.text_input("Sender Email (e.g., your_email@163.com)")
-        sender_pwd = st.text_input("Sender Password / Auth Code", type="password")
-    with col_em2:
-        smtp_server = st.text_input("SMTP Server (e.g., smtp.163.com)", "smtp.163.com")
-        smtp_port = st.number_input("SMTP Port (usually 465 for SSL or 25/587)", value=465)
-        
-    receiver_email = st.text_input("Receiver Email", "changhaiduan@163.com")
-    
-    if st.button("Start Download & Send Email"):
+    if st.button("Start Download"):
         ids = [i.strip() for i in custom_ids_text.split('\n') if i.strip()]
         if not ids:
             st.error("Please enter at least one Genome ID.")
-        elif not (sender_email and sender_pwd and smtp_server and receiver_email):
-            st.error("Please fill in all Email Configuration fields to receive the report.")
         else:
             if ensure_datasets_cli():
                 st_cont = st.empty()
@@ -845,20 +802,7 @@ with tab3:
                 report_df["Status"] = report_df["Normalized_Accession"].apply(lambda x: "Success" if x in s_list else "Failed")
                 report_df.to_csv(report_file, index=False)
                 
-                # Prepare Email Summary
-                summary = f"NCBI Datasets Download Summary:\n\n"
-                summary += f"Total Requested: {len(ids)}\n"
-                summary += f"Successfully Downloaded: {len(s_list)}\n"
-                summary += f"Failed to Download: {len(f_list)}\n\n"
-                summary += "Please find the detailed status report attached."
-                
-                st_cont.info("Sending email report...")
-                email_succ, email_msg = send_email_report(sender_email, sender_pwd, smtp_server, smtp_port, receiver_email, report_file, summary)
-                
-                if email_succ:
-                    st.success("🎉 Download finished and email sent successfully!")
-                else:
-                    st.error(f"Download finished, but failed to send email: {email_msg}")
+                st.success(f"🎉 Download finished! Detailed report saved to `{report_file}`.")
             else:
                 st.error("NCBI Datasets CLI could not be installed.")
 
