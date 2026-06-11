@@ -320,22 +320,63 @@ def write_accession_list(
     mapping: Dict[str, str],
     output_dir: str,
     release: str,
-    taxa: List[str],
+    query_labels: List[str],
     mode: str,
+    source_label: str = "GTDB",
 ) -> str:
     path = os.path.join(output_dir, "accessions.csv")
     with open(path, "w", newline="") as fh:
         writer = csv.writer(fh)
-        writer.writerow(["Release", "Taxon_Query", "GTDB_Genome_ID", "NCBI_Accession", "Mode", "Source"])
+        writer.writerow(["Release", "Query", "GTDB_Genome_ID", "NCBI_Accession", "Mode", "Source"])
         for gid, acc in sorted(mapping.items()):
-            for taxon in taxa:
-                writer.writerow([release, taxon, gid, acc, mode, "GTDB"])
+            for label in query_labels:
+                writer.writerow([release, label, gid, acc, mode, source_label])
     return path
 
 
 def _sanitize_dir(name: str) -> str:
     name = re.sub(r"[^A-Za-z0-9_.-]+", "_", name.strip())
     return name.strip("_") or "taxon"
+
+
+def _normalize_accession(text: str) -> str:
+    text = text.strip()
+    text = re.sub(r"^(RS_|GB_)", "", text)
+    return text
+
+
+def _collect_direct_accessions(raw_accessions: Optional[List[str]], accession_file: Optional[str]) -> List[str]:
+    values: List[str] = []
+    for item in raw_accessions or []:
+        values.extend([x for x in item.split(",") if x.strip()])
+    if accession_file:
+        with open(accession_file, "r", encoding="utf-8", errors="ignore") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                values.extend([x for x in re.split(r"[\s,]+", line) if x.strip()])
+    normalized = [_normalize_accession(x) for x in values if x.strip()]
+    return sorted(set(x for x in normalized if x))
+
+
+def _materialize_import_dir(pool_dir: str, import_to_dir: str, import_mode: str) -> int:
+    os.makedirs(import_to_dir, exist_ok=True)
+    imported = 0
+    for name in os.listdir(pool_dir):
+        src = os.path.join(pool_dir, name)
+        dst = os.path.join(import_to_dir, name)
+        if os.path.isdir(src) or os.path.exists(dst):
+            continue
+        if import_mode == "copy":
+            shutil.copy2(src, dst)
+        else:
+            try:
+                os.symlink(os.path.abspath(src), dst)
+            except OSError:
+                shutil.copy2(src, dst)
+        imported += 1
+    return imported
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -346,34 +387,63 @@ def main(argv: Optional[List[str]] = None) -> int:
             "then batch-download genomes with the NCBI `datasets` CLI."
         ),
     )
-    parser.add_argument("--release", default=DEFAULT_RELEASE, help="GTDB release, e.g. 220.0")
+    parser.add_argument("-R", "--release", default=DEFAULT_RELEASE, help="GTDB release, e.g. 220.0")
     parser.add_argument(
+        "-t",
         "--taxon",
         action="append",
-        required=True,
         help="GTDB taxon to keep. Repeatable. Comma-separated values inside one --taxon are also accepted.",
     )
-    parser.add_argument("--rank", default=None, choices=["d", "p", "c", "o", "f", "g", "s"])
     parser.add_argument(
+        "-a",
+        "--accession",
+        action="append",
+        help="Direct NCBI assembly accession(s) to download. Repeatable and comma-separated values are supported.",
+    )
+    parser.add_argument(
+        "-A",
+        "--accession-file",
+        default=None,
+        help="Text file containing one accession per line, or comma/space separated accessions.",
+    )
+    parser.add_argument("-r", "--rank", default=None, choices=["d", "p", "c", "o", "f", "g", "s"])
+    parser.add_argument(
+        "-m",
+        "--scope",
         "--mode",
         choices=["representative", "all", "accessions-only"],
         default="representative",
         help="representative = only GTDB representative genomes; all = all matched genomes; accessions-only = no FASTA download.",
     )
-    parser.add_argument("--output-root", default="gtdb_downloads")
+    parser.add_argument("-o", "--out-dir", "--output-root", dest="output_root", default="gtdb_downloads")
     parser.add_argument(
+        "-j",
         "--threads",
         type=int,
         default=4,
         help="Number of concurrent `datasets` batch tasks.",
     )
     parser.add_argument(
+        "-b",
         "--batch-size",
         type=int,
         default=50,
         help="How many accessions to put into each `datasets download genome accession` task.",
     )
-    parser.add_argument("--list-releases", action="store_true")
+    parser.add_argument(
+        "-i",
+        "--import-dir",
+        "--import-to-dir",
+        default=None,
+        help="Optional folder to receive the downloaded GTDB fasta files so they can be used directly as input to the dataset-management step.",
+    )
+    parser.add_argument(
+        "--import-mode",
+        choices=["symlink", "copy"],
+        default="symlink",
+        help="How to populate --import-to-dir: symlink is fast and space-saving, copy is fully standalone.",
+    )
+    parser.add_argument("-L", "--list-releases", action="store_true")
     parser.add_argument("--no-cache", action="store_true")
     args = parser.parse_args(argv)
 
@@ -386,10 +456,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         raise SystemExit("`datasets` CLI not found. Please run inside the pixi environment.")
 
     taxa: List[str] = []
-    for item in args.taxon:
+    for item in args.taxon or []:
         taxa.extend([t for t in item.split(",") if t.strip()])
-    if not taxa:
-        parser.error("No --taxon supplied.")
+    direct_accessions = _collect_direct_accessions(args.accession, args.accession_file)
+    if not taxa and not direct_accessions:
+        parser.error("Please provide --taxon or --accession/--accession-file.")
 
     signal.signal(signal.SIGINT, _sigint)
     started = dt.datetime.now()
@@ -403,37 +474,54 @@ def main(argv: Optional[List[str]] = None) -> int:
     print("== GTDB genome downloader ==", flush=True)
     print(f"Release: {args.release}", flush=True)
     print(f"Taxa: {taxa}", flush=True)
+    print(f"Direct accessions: {len(direct_accessions)}", flush=True)
     print(f"Mode: {args.mode}", flush=True)
     print(f"Threads: {args.threads}", flush=True)
     print(f"Batch size: {args.batch_size}", flush=True)
     print(f"Output root: {os.path.abspath(args.output_root)}", flush=True)
+    if args.import_to_dir:
+        print(f"Import to dir: {os.path.abspath(args.import_to_dir)} ({args.import_mode})", flush=True)
 
-    print("\n[1/4] Downloading GTDB taxonomy tables ...", flush=True)
-    bac_tx, arc_tx = download_taxonomy(args.release, args.output_root)
+    genome_ids: Set[str] = set()
+    acc_map: Dict[str, str] = {}
+    query_labels: List[str] = []
+    query_root = "by_taxon"
 
-    print("\n[2/4] Resolving taxa to GTDB genome IDs ...", flush=True)
-    genome_ids = collect_genome_ids([bac_tx, arc_tx], taxa, args.rank)
-    print(f"  matched genome IDs: {len(genome_ids)}", flush=True)
-    if not genome_ids:
-        print("No genomes matched.", flush=True)
-        return 1
+    if taxa:
+        print("\n[1/4] Downloading GTDB taxonomy tables ...", flush=True)
+        bac_tx, arc_tx = download_taxonomy(args.release, args.output_root)
 
-    print("\n[3/4] Downloading GTDB metadata and extracting assembly accessions ...", flush=True)
-    bac_meta, arc_meta = download_metadata(args.release, args.output_root)
-    acc_map = parse_metadata_to_accession_map(
-        [bac_meta, arc_meta],
-        genome_ids,
-        only_representative=(args.mode == "representative"),
-    )
-    print(f"  mapped NCBI accessions: {len(acc_map)}", flush=True)
-    if not acc_map:
-        print("No NCBI accessions resolved from metadata.", flush=True)
-        return 1
+        print("\n[2/4] Resolving taxa to GTDB genome IDs ...", flush=True)
+        genome_ids = collect_genome_ids([bac_tx, arc_tx], taxa, args.rank)
+        print(f"  matched genome IDs: {len(genome_ids)}", flush=True)
+        if not genome_ids:
+            print("No genomes matched.", flush=True)
+            return 1
 
-    for taxon in taxa:
-        taxon_dir = os.path.join(args.output_root, "by_taxon", _sanitize_dir(taxon))
-        os.makedirs(taxon_dir, exist_ok=True)
-        csv_path = write_accession_list(acc_map, taxon_dir, args.release, [taxon], args.mode)
+        print("\n[3/4] Downloading GTDB metadata and extracting assembly accessions ...", flush=True)
+        bac_meta, arc_meta = download_metadata(args.release, args.output_root)
+        acc_map = parse_metadata_to_accession_map(
+            [bac_meta, arc_meta],
+            genome_ids,
+            only_representative=(args.mode == "representative"),
+        )
+        print(f"  mapped NCBI accessions: {len(acc_map)}", flush=True)
+        if not acc_map:
+            print("No NCBI accessions resolved from metadata.", flush=True)
+            return 1
+        query_labels = taxa
+        query_root = "by_taxon"
+    else:
+        print("\n[1/2] Using direct accession input ...", flush=True)
+        acc_map = {acc: acc for acc in direct_accessions}
+        query_labels = direct_accessions
+        query_root = "by_accession"
+        print(f"  normalized direct accessions: {len(acc_map)}", flush=True)
+
+    for label in query_labels:
+        query_dir = os.path.join(args.output_root, query_root, _sanitize_dir(label))
+        os.makedirs(query_dir, exist_ok=True)
+        csv_path = write_accession_list(acc_map, query_dir, args.release, [label], args.mode, source_label="GTDB" if taxa else "Direct_Accession")
         print(f"  wrote accession list -> {csv_path}", flush=True)
 
     if args.mode == "accessions-only":
@@ -449,18 +537,21 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
         print(f"  extracted FASTA files: {extracted}", flush=True)
         print(f"  failed batches: {failed_batches}", flush=True)
-        for taxon in taxa:
-            taxon_fasta_dir = os.path.join(args.output_root, "by_taxon", _sanitize_dir(taxon), "fasta")
-            os.makedirs(taxon_fasta_dir, exist_ok=True)
+        for label in query_labels:
+            query_fasta_dir = os.path.join(args.output_root, query_root, _sanitize_dir(label), "fasta")
+            os.makedirs(query_fasta_dir, exist_ok=True)
             for name in os.listdir(pool_dir):
                 src = os.path.join(pool_dir, name)
-                dst = os.path.join(taxon_fasta_dir, name)
+                dst = os.path.join(query_fasta_dir, name)
                 if os.path.isdir(src) or os.path.exists(dst):
                     continue
                 try:
                     os.symlink(os.path.abspath(src), dst)
                 except OSError:
                     shutil.copy2(src, dst)
+        if args.import_to_dir:
+            imported = _materialize_import_dir(pool_dir, args.import_to_dir, args.import_mode)
+            print(f"  imported {imported} fasta files into {args.import_to_dir}", flush=True)
 
     ended = dt.datetime.now()
     log_path = os.path.join(args.output_root, "gtdb_download.log")
@@ -470,10 +561,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         fh.write(f"Release: {args.release}\n")
         fh.write(f"Mode: {args.mode}\n")
         fh.write(f"Taxa: {taxa}\n")
+        fh.write(f"Direct accessions: {len(direct_accessions)}\n")
         fh.write(f"Threads: {args.threads}\n")
         fh.write(f"Batch size: {args.batch_size}\n")
         fh.write(f"Matched genome IDs: {len(genome_ids)}\n")
         fh.write(f"Mapped NCBI accessions: {len(acc_map)}\n")
+        fh.write(f"Import to dir: {args.import_to_dir or ''}\n")
         fh.write(f"Elapsed: {ended - started}\n")
         fh.write("=" * 60 + "\n")
     print(f"\nLog appended to {log_path}", flush=True)

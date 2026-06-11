@@ -488,22 +488,26 @@ def main():
         prog="db_builder_cli",
         description="Build a versioned genome database from multiple source folders without modifying original files.",
     )
-    parser.add_argument("--db-name", required=True)
-    parser.add_argument("--db-version", required=True)
-    parser.add_argument("--database-root", help="Root directory containing one subfolder per source.")
-    parser.add_argument("--sources", nargs="+", help="One or more source directories.")
-    parser.add_argument("--output-root", default="local_databases", help="Root output directory.")
+    parser.add_argument("-n", "--name", "--db-name", dest="db_name", required=True)
+    parser.add_argument("-v", "--version", "--db-version", dest="db_version", required=True)
+    parser.add_argument("-D", "--source-root", "--database-root", dest="database_root", help="Root directory containing one subfolder per source.")
+    parser.add_argument("-s", "--source-dir", "--sources", dest="sources", nargs="+", help="One or more source directories.")
+    parser.add_argument("-o", "--out-dir", "--output-root", dest="output_root", default="local_databases", help="Root output directory.")
     parser.add_argument(
+        "-j",
         "--threads",
         type=int,
         default=8,
         help="Threads used by barrnap and CheckM2 (barrnap scales well; CheckM2 1.1.0 has a Python 3.12 pickling bug at high thread counts, so 4-8 is a safe ceiling).",
     )
-    parser.add_argument("--run-checkm2", action="store_true", default=False)
-    parser.add_argument("--run-barrnap", action="store_true", default=False)
-    parser.add_argument("--barrnap-kingdom", default="bac", choices=["bac", "arc", "euk", "mito"])
+    parser.add_argument("-Q", "--checkm2", "--run-checkm2", dest="run_checkm2", action="store_true", default=False)
+    parser.add_argument("-B", "--barrnap", "--run-barrnap", dest="run_barrnap", action="store_true", default=False)
+    parser.add_argument("-k", "--rrna-kingdom", "--barrnap-kingdom", dest="barrnap_kingdom", default="bac", choices=["bac", "arc", "euk", "mito"])
     parser.add_argument(
+        "-c",
+        "--checkm2-db",
         "--checkm2-db-path",
+        dest="checkm2_db_path",
         default=None,
         help=(
             "Explicit path to the CheckM2 DIAMOND database file (*.dmnd) or to a "

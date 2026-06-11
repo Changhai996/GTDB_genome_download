@@ -1,202 +1,243 @@
 # GTDB Renew
 
-End-to-end pipeline for:
+`GTDB Renew` 现在分成三部分，统一通过 `gtdbkit` 管理：
 
-1. **Downloading GTDB genomes** for a specified release, filtered to any
-   GTDB taxon (phylum, class, order, family, genus, species). The downloader
-   reads the GTDB taxonomy + metadata tables, extracts assembly accession
-   numbers, and then launches multiple parallel `datasets download genome accession`
-   tasks. No full GTDB FASTA tar package is downloaded.
-2. **Building a versioned local genome database** from those genomes
-   (and any additional local sources). Each version is reproducible:
-   standardized filenames, contig-header renaming to match the genome
-   name, basic statistics, optional barrnap rRNA extraction, optional
-   CheckM2 quality assessment.
+1. **网页版**
+   - GTDB 版本比较
+   - 网页可视化浏览
+   - 网页下载与比较
+2. **命令行下载工具**
+   - 按 GTDB `taxon` 下载
+   - 按 `accession` 下载
+   - 使用 GTDB metadata 提取 accession
+   - 使用 `ncbi_datasets` 分批并行下载
+3. **数据库构建与维护工具**
+   - 基因组文件重命名
+   - contig / sequence header 统一
+   - CheckM2 质控
+   - barrnap 提取 rRNA
+   - 16S 等 rRNA 序列输出
+   - 版本化数据库管理
 
-The project is fully managed by [Pixi](https://pixi.sh) — one command
-resolves Python 3.12, `checkm2`, `barrnap`, `pandas`, `requests`, and
-the DIAMOND runtime.
+## 新入口名称
 
-## Supported platforms
+统一入口现在推荐使用：
 
-| Platform | Status |
+```bash
+pixi run gtdbkit
+```
+
+旧入口 `gttdb` 仍然保留兼容，但以后建议都使用 `gtdbkit`。
+
+## 平台支持
+
+| 平台 | 状态 |
 |---|---|
-| macOS 14 (arm64) | ✅ tested |
-| Linux x86_64     | ✅ tested |
-| Linux aarch64    | ⏳ should work (bioconda checkm2 available) |
-| Windows          | ❌ not supported (checkm2 + multiprocessing issues) |
+| macOS arm64 | ✅ 已测试 |
+| Linux x86_64 | ✅ 已测试 |
+| Linux aarch64 | ⏳ 理论可用 |
+| Windows | ❌ 不支持 |
 
-## One-shot install (Linux)
+## 环境安装
+
+项目使用 [Pixi](https://pixi.sh) 管理环境和依赖。
 
 ```bash
-git clone <your-fork-url> GTDB_renew
-cd GTDB_renew
+git clone https://github.com/Changhai996/GTDB_genome_download
+cd GTDB_genome_download
+pixi install
+```
+
+如果是 Linux / macOS，也可以直接：
+
+```bash
 chmod +x run.sh
-./run.sh run-all \
-    --db-name Bathyarchaeia \
-    --db-version v1.0 \
-    --release 220.0 \
-    --taxon "p__Bathyarchaeota" \
-    --run-checkm2 \
-    --run-barrnap
+./run.sh gtdbkit --help
 ```
 
-The first run downloads Pixi (~10 MB) and resolves ~3 GB of
-dependencies (CheckM2 + DIAMOND + barrnap + Python 3.12 + friends).
-Subsequent runs are fast — Pixi caches everything.
+## 第一部分：网页版
 
-## Subcommands
-
-### `download-gtdb`
+打开网页版：
 
 ```bash
-./run.sh download-gtdb --release 220.0 --taxon "p__Bathyarchaeota" --mode representative
-./run.sh download-gtdb --release 220.0 --taxon "c__Bathyarchaeia" --mode all
-./run.sh download-gtdb --list-releases
+pixi run gtdbkit web
 ```
 
-- `--mode representative` keeps only rows where GTDB metadata marks the
-  genome as the GTDB representative, extracts the assembly accession from
-  the metadata table, then downloads those genomes with batched
-  `datasets download genome accession` jobs.
-- `--mode all` keeps every matched GTDB genome, extracts their assembly
-  accession numbers from metadata, and downloads them the same way.
-- `--mode accessions-only` stops after writing `accessions.csv`, which is
-  useful for auditing the selected accessions before any download starts.
-- `--taxon` is repeatable and accepts any GTDB rank
-  (`p__`, `c__`, `o__`, `f__`, `g__`, `s__`).
-- `--rank {d|p|c|o|f|g|s}` is optional and forces the rank of
-  matching taxa.
-- `--batch-size` controls how many accessions are bundled into each
-  `datasets` task; `--threads` controls how many batches run concurrently.
-
-### `build`
+或：
 
 ```bash
-./run.sh build \
-    --db-name Bathyarchaeia \
-    --db-version v1.0 \
-    --database-root /path/to/Database \
-    --output-root ./local_databases \
-    --threads 8 \
-    --run-checkm2 \
-    --run-barrnap \
-    --checkm2-db-path /path/to/CheckM2_database/uniref100.KO.1.dmnd
+pixi run web
 ```
 
-Or specify sources directly:
+网页版主文件：
+
+- [app.py](file:///Users/duanchanghai/Downloads/tools/GTDB_renew/app.py)
+
+主要功能：
+
+- GTDB 版本比较
+- Custom Download
+- Dataset Updater
+- Database Builder
+
+## 第二部分：GTDB 下载
+
+主命令：
 
 ```bash
-./run.sh build \
-    --db-name Bathyarchaeia --db-version v1.0 \
-    --sources /path/to/Source_A /path/to/Source_B \
-    --threads 8 --run-checkm2 --run-barrnap
+pixi run gtdbkit fetch --help
 ```
 
-Each invocation:
-
-- Walks `--database-root/<source>/...` (or every `--sources`) and
-  resolves FASTA files at any depth.
-- Copies each FASTA into
-  `<output-root>/<db-name>_<db-version>/genomes/<standardized>.fna`
-  with **contig headers renamed to match the standardized genome name**.
-  Original files are never modified.
-- Records `Original_Name / Original_Path / Source_Folder /
-  Standardized_Name / File_MD5` in a mapping CSV.
-- Computes `Genome_Size_bp / Contig_Count / GC_Content_%`.
-- Runs **barrnap** to extract rRNA and writes
-  `<standardized>.gff`, `<standardized>_rrna.fasta` (the union of all
-  rRNA types), and `<standardized>_16S.fasta` (16S slices taken
-  directly from the genome using GFF coordinates — independent of
-  barrnap's own `--outseq`).
-- Runs **CheckM2** on the new genomes, reports
-  `Completeness / Contamination / GTDB_Score`, and folds
-  `Quality_Status` (`ok` / `no_database` / `failed` / `skipped` /
-  `carried_forward`) into the metadata.
-- Compares to the previous version snapshot and marks new vs.
-  carried-forward genomes.
-- Writes a comprehensive `build_summary.log` with parameter
-  snapshot, source counts, CheckM2 status, and file inventory.
-
-### `run-all`
-
-Convenience wrapper: `download-gtdb` followed by `build`.
+### 1. 按 taxon 下载
 
 ```bash
-./run.sh run-all \
-    --db-name Bathyarchaeia \
-    --db-version v1.0 \
-    --release 220.0 \
-    --taxon "p__Bathyarchaeota" \
-    --run-checkm2 \
-    --run-barrnap \
-    --checkm2-db-path /path/to/CheckM2_database/uniref100.KO.1.dmnd
+pixi run gtdbkit fetch \
+  -R 220.0 \
+  -t "c__Bathyarchaeia" \
+  -m representative \
+  -j 4 \
+  -b 50
 ```
 
-Use `--extra-sources /path/A /path/B` to merge local genomes with the
-GTDB pull.
+说明：
 
-## Incremental versioning
+- `-t / --taxon`：指定 GTDB 类群
+- `-m / --scope`：`representative`、`all`、`accessions-only`
+- `-j / --threads`：并行下载批次数
+- `-b / --batch-size`：每个 `datasets` 批次的 accession 数量
 
-The build step looks for a previous snapshot of the same `db-name` and
-copies the existing `genomes/` + `barrnap_results/` into the new
-output directory, only processing **new** files (MD5-based). To force
-a re-build, change `--db-version` (e.g. `v1.0` → `v1.1`).
+### 2. 按 accession 下载
 
-## CheckM2 caveat (Python 3.12)
+```bash
+pixi run gtdbkit fetch \
+  -a GCA_003151735.1,GCF_000196175.1 \
+  -j 4 \
+  -b 20
+```
 
-CheckM2 1.1.0 has a known multiprocessing pickling bug under
-Python 3.12 (`AttributeError: 'Predictor' object has no attribute
-'__set_up_prodigal_thread'`). This project ships two complementary
-fixes:
+或：
 
-1. `checkm2_compat/sitecustomize.py` — auto-injected via
-   `PYTHONPATH` so that `multiprocessing.Pool` uses the `fork`
-   start method.
-2. An in-place patch at the bottom of
-   `<pixi-env>/lib/python3.12/site-packages/checkm2/predictQuality.py`
-   that adds unmangled aliases for the four private `Predictor`
-   methods. This patch is applied automatically by `db_builder_cli.py`
-   the first time `--run-checkm2` succeeds — look for the comment
-   "GTDB Renew compatibility patch" at the bottom of the file. If
-   you `pixi install` again and the patch is lost, simply re-run
-   `./run.sh build --run-checkm2` once; on failure the patch is
-   reapplied.
+```bash
+pixi run gtdbkit fetch -A accession_list.txt
+```
 
-If you would rather avoid touching `site-packages`, set
-`--threads 1` and the bug disappears — slower, but safe.
+### 3. 直接导入第三部分输入目录
 
-## CheckM2 database path
+第二部分下载的数据，可以直接作为第三部分输入：
 
-The build step resolves the DIAMOND database in this order:
+```bash
+pixi run gtdbkit fetch \
+  -t "c__Bathyarchaeia" \
+  -i /Users/duanchanghai/Downloads/Database/GTDB_Bathyarchaeia
+```
 
-1. `--checkm2-db-path` (a `.dmnd` file or a directory containing one)
-2. `$CHECKM2DB` / `$DIAMOND_DB` environment variable
+`-i / --import-dir` 支持两种方式：
+
+- 默认 `symlink`
+- 可选 `copy`
+
+## 第三部分：数据库构建与维护
+
+主命令：
+
+```bash
+pixi run gtdbkit build-db --help
+```
+
+### 1. 以总目录方式构建
+
+```bash
+pixi run gtdbkit build-db \
+  -n Bathyarchaeia \
+  -v v1.0 \
+  -D /Users/duanchanghai/Downloads/Database \
+  -o local_databases \
+  -j 8 \
+  -Q \
+  -B \
+  -c /path/to/uniref100.KO.1.dmnd
+```
+
+说明：
+
+- `-D / --source-root`：总输入目录，一级子目录视为来源
+- `-n / --name`：数据库名称
+- `-v / --version`：数据库版本
+- `-Q / --checkm2`：启用 CheckM2
+- `-B / --barrnap`：启用 barrnap
+- `-c / --checkm2-db`：CheckM2 数据库路径
+
+### 2. 以多个来源目录方式构建
+
+```bash
+pixi run gtdbkit build-db \
+  -n Bathyarchaeia \
+  -v v1.0 \
+  -s /path/to/source_A /path/to/source_B \
+  -j 8 \
+  -Q \
+  -B
+```
+
+### 第三部分会做什么
+
+- 递归扫描 `fa / fna / fasta`
+- 不修改原始文件
+- 标准化文件名
+- 标准化内部序列 header
+- contig header 与最终 genome 名统一
+- 输出重命名前后映射表
+- 统计 `Genome_Size_bp / Contig_Count / GC_Content_%`
+- 运行 CheckM2，输出 `Completeness / Contamination / GTDB_Score`
+- 运行 barrnap，输出 GFF 与 rRNA fasta
+- 额外提取 16S rRNA fasta
+- 生成 metadata、log、版本比较表
+- 支持基于 MD5 的增量版本处理
+
+## 第二 + 第三部分一体化
+
+如果想“先下载 GTDB，再自动导入并构库”，使用：
+
+```bash
+pixi run gtdbkit prepare-db \
+  -n Bathyarchaeia \
+  -v v1.0 \
+  -t "c__Bathyarchaeia" \
+  -i /Users/duanchanghai/Downloads/Database/GTDB_Bathyarchaeia \
+  -j 8 \
+  -Q \
+  -B \
+  -c /path/to/uniref100.KO.1.dmnd
+```
+
+注意：
+
+- 这里需要 `-t` 或 `-a`，是因为第一步要先下载
+- 并不是第三部分本身需要 `taxon`
+
+## CheckM2 数据库路径
+
+构建阶段会按以下优先级寻找 CheckM2 DIAMOND 数据库：
+
+1. `-c / --checkm2-db`
+2. 环境变量 `CHECKM2DB` / `DIAMOND_DB`
 3. `<project>/checkm2_database/CheckM2_database/*.dmnd`
 4. `<project>/checkm2_database/*.dmnd`
 
-The first one that exists wins. The resolved path is written into the
-CheckM2 child-process environment automatically.
-
-Download a CheckM2 database with:
+下载 CheckM2 数据库：
 
 ```bash
 pixi run checkm2 database --download
 ```
 
-The default download location is `~/databases/CheckM2_database/`;
-move it into `<project>/checkm2_database/CheckM2_database/` to use
-the project-local default lookup, or pass it via
-`--checkm2-db-path`.
+## 典型输出目录
 
-## Outputs of a single build
-
-```
+```text
 local_databases/Bathyarchaeia_v1.0/
-├── genomes/                          standardized per-genome fasta
-├── barrnap_results/                  *.gff, *_rrna.fasta, *_16S.fasta
-├── checkm2_results/                  quality_report.tsv, checkm2.log
-├── Bathyarchaeia_v1.0_metadata.csv   one row per genome
+├── genomes/
+├── barrnap_results/
+├── checkm2_results/
+├── Bathyarchaeia_v1.0_metadata.csv
 ├── Bathyarchaeia_v1.0_genome_id_mapping.csv
 ├── Bathyarchaeia_v1.0_scan_inventory.csv
 ├── Bathyarchaeia_v1.0_source_counts.csv
@@ -204,21 +245,38 @@ local_databases/Bathyarchaeia_v1.0/
 └── build_summary.log
 ```
 
-## Layout
+## 主要文件
 
-```
+```text
 GTDB_renew/
-├── pixi.toml                        pixi workspace + tasks
-├── gttdb.py                         unified CLI (subcommands)
-├── db_builder_cli.py                versioned database builder
-├── gtdb_downloader.py               GTDB downloader + taxon filter
+├── app.py
+├── gtdbkit.py
+├── gttdb.py
+├── gtdb_downloader.py
+├── db_builder_cli.py
 ├── checkm2_compat/
-│   └── sitecustomize.py             Python 3.12 compat shim
-├── run.sh                           one-shot launcher
-└── README.md                        this file
+│   └── sitecustomize.py
+├── pixi.toml
+├── run.sh
+└── README.md
 ```
+
+说明：
+
+- `gtdbkit.py`：新的统一入口
+- `gttdb.py`：旧入口兼容包装器
+- `gtdb_downloader.py`：第二部分下载器
+- `db_builder_cli.py`：第三部分数据库构建器
+
+## 兼容旧命令
+
+这些旧名字仍可用，但不再推荐：
+
+- `gttdb` -> `gtdbkit`
+- `download-gtdb` -> `fetch`
+- `build` -> `build-db`
+- `run-all` -> `prepare-db`
 
 ## License
 
-Internal tool. CheckM2, barrnap, and DIAMOND are governed by their
-own licenses.
+内部工具；`CheckM2`、`barrnap`、`DIAMOND` 遵循各自许可证。
