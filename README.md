@@ -27,6 +27,12 @@
 pixi run gtdbkit
 ```
 
+也提供一个更短的别名：
+
+```bash
+pixi run gtk
+```
+
 旧入口 `gttdb` 仍然保留兼容，但以后建议都使用 `gtdbkit`。
 
 ## 平台支持
@@ -52,7 +58,7 @@ pixi install
 
 ```bash
 chmod +x run.sh
-./run.sh gtdbkit --help
+./run.sh help
 ```
 
 ## 第一部分：网页版
@@ -71,7 +77,7 @@ pixi run web
 
 网页版主文件：
 
-- [app.py](file:///Users/duanchanghai/Downloads/tools/GTDB_renew/app.py)
+- `app.py`
 
 主要功能：
 
@@ -166,6 +172,8 @@ pixi run gtdbkit build-db \
 - `-Q / --checkm2`：启用 CheckM2
 - `-B / --barrnap`：启用 barrnap
 - `-c / --checkm2-db`：CheckM2 数据库路径
+- `--exclude-hidden / --no-exclude-hidden`：是否跳过 `.DS_Store`、`._*` 等隐藏文件
+- `--strict-fasta-check / --no-strict-fasta-check`：是否按文件内容校验 FASTA 格式，并自动识别无标准后缀的 FASTA
 
 ### 2. 以多个来源目录方式构建
 
@@ -181,7 +189,7 @@ pixi run gtdbkit build-db \
 
 ### 第三部分会做什么
 
-- 递归扫描 `fa / fna / fasta`
+- 递归扫描 `fa / fna / fasta`，并可自动识别无标准后缀但内容符合 FASTA 格式的文件
 - 不修改原始文件
 - 标准化文件名
 - 标准化内部序列 header
@@ -193,6 +201,7 @@ pixi run gtdbkit build-db \
 - 额外提取 16S rRNA fasta
 - 生成 metadata、log、版本比较表
 - 支持基于 MD5 的增量版本处理
+- 启动时打印隐藏文件、异常 FASTA、无后缀 FASTA 的发现统计
 
 ## 第二 + 第三部分一体化
 

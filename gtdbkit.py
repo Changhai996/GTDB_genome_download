@@ -70,6 +70,18 @@ def _add_build_parser(sub: argparse._SubParsersAction) -> None:
         default=None,
         help="CheckM2 DIAMOND 数据库路径，可为 .dmnd 文件或其所在目录。",
     )
+    p.add_argument(
+        "--exclude-hidden",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="是否跳过隐藏文件，例如 .DS_Store 和 ._* AppleDouble 文件。默认开启。",
+    )
+    p.add_argument(
+        "--strict-fasta-check",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="是否按文件内容校验 FASTA 格式，并自动识别无标准后缀的 FASTA。默认开启。",
+    )
 
 
 def _add_download_parser(sub: argparse._SubParsersAction) -> None:
@@ -150,6 +162,18 @@ def _add_prepare_parser(sub: argparse._SubParsersAction) -> None:
     p.add_argument("-B", "--barrnap", "--run-barrnap", dest="run_barrnap", action="store_true", default=False, help="启用 barrnap。")
     p.add_argument("-k", "--rrna-kingdom", "--barrnap-kingdom", dest="barrnap_kingdom", default="bac", choices=["bac", "arc", "euk", "mito"])
     p.add_argument("-c", "--checkm2-db", "--checkm2-db-path", dest="checkm2_db_path", default=None)
+    p.add_argument(
+        "--exclude-hidden",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="是否跳过隐藏文件，例如 .DS_Store 和 ._* AppleDouble 文件。默认开启。",
+    )
+    p.add_argument(
+        "--strict-fasta-check",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="是否按文件内容校验 FASTA 格式，并自动识别无标准后缀的 FASTA。默认开启。",
+    )
     p.add_argument(
         "-s",
         "--source-dir",
@@ -235,6 +259,8 @@ def _route_prepare(argv: list) -> int:
     parser.add_argument("-B", "--barrnap", "--run-barrnap", dest="run_barrnap", action="store_true", default=False)
     parser.add_argument("-k", "--rrna-kingdom", "--barrnap-kingdom", dest="barrnap_kingdom", default="bac", choices=["bac", "arc", "euk", "mito"])
     parser.add_argument("-c", "--checkm2-db", "--checkm2-db-path", dest="checkm2_db_path", default=None)
+    parser.add_argument("--exclude-hidden", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--strict-fasta-check", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("-s", "--source-dir", "--extra-sources", dest="extra_sources", nargs="+", default=[])
     parser.add_argument("-d", "--download-dir", "--download-root", dest="download_root", default="gtdb_downloads")
     parser.add_argument("-o", "--out-dir", "--output-root", dest="output_root", default="local_databases")
@@ -298,6 +324,10 @@ def _route_prepare(argv: list) -> int:
         build_argv += ["--run-barrnap", "--barrnap-kingdom", args.barrnap_kingdom]
     if args.checkm2_db_path:
         build_argv += ["--checkm2-db-path", args.checkm2_db_path]
+    if not args.exclude_hidden:
+        build_argv += ["--no-exclude-hidden"]
+    if not args.strict_fasta_check:
+        build_argv += ["--no-strict-fasta-check"]
 
     print("\n== Phase 2: build versioned database ==", flush=True)
     rc = _route_build(build_argv)

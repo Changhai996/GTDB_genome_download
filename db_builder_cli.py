@@ -41,8 +41,69 @@ def ensure_unique_filename(output_dir: str, base_name: str, ext: str, max_len: i
         idx += 1
 
 
+def has_fasta_extension(filename: str) -> bool:
+    name = os.path.basename(filename)
+    return name.lower().endswith((".fna", ".fa", ".fasta"))
+
+
+def is_hidden_file(filename: str) -> bool:
+    name = os.path.basename(filename)
+    return bool(name) and (name.startswith(".") or name.startswith("._"))
+
+
 def is_fasta_file(filename: str) -> bool:
-    return filename.lower().endswith((".fna", ".fa", ".fasta"))
+    return has_fasta_extension(filename)
+
+
+def is_probable_text_fasta(path: str, probe_bytes: int = 4096) -> Tuple[bool, str]:
+    """Best-effort validation to avoid crashing on AppleDouble/binary junk files."""
+    try:
+        with open(path, "rb") as fh:
+            chunk = fh.read(probe_bytes)
+    except OSError as exc:
+        return False, f"cannot read file: {exc}"
+
+    if not chunk:
+        return False, "empty file"
+    if b"\x00" in chunk:
+        return False, "binary file detected (NUL byte present)"
+    try:
+        preview = chunk.decode("utf-8")
+    except UnicodeDecodeError:
+        return False, "file is not valid UTF-8 text"
+
+    first_nonblank = next((line.strip() for line in preview.splitlines() if line.strip()), "")
+    if first_nonblank and not first_nonblank.startswith(">"):
+        return False, "first non-empty line is not a FASTA header"
+    return True, ""
+
+
+def classify_input_file(
+    path: str,
+    exclude_hidden: bool = True,
+    strict_fasta_check: bool = True,
+) -> Tuple[str, str]:
+    name = os.path.basename(path)
+    if exclude_hidden and is_hidden_file(name):
+        return "hidden_skipped", "hidden file (dotfile or AppleDouble resource fork)"
+
+    has_ext = has_fasta_extension(name)
+    if not strict_fasta_check:
+        if has_ext:
+            return "fasta", ""
+        return "non_fasta_ignored", "no standard FASTA suffix and strict FASTA check is disabled"
+
+    looks_like_fasta, reason = is_probable_text_fasta(path)
+
+    if has_ext:
+        if strict_fasta_check and not looks_like_fasta:
+            return "invalid_fasta_skipped", reason
+        return "fasta", ""
+
+    if looks_like_fasta:
+        return "fasta_detected_by_content", "no standard FASTA suffix; accepted by content check"
+
+    return "non_fasta_ignored", reason
 
 
 def get_tool_path(tool_name: str) -> Optional[str]:
@@ -122,7 +183,7 @@ def standardize_fasta_stream(input_path: str, output_path: str, contig_prefix: s
     contig_count = 0
     total_len = 0
     gc_count = 0
-    with open(input_path, "r") as fin, open(output_path, "w") as fout:
+    with open(input_path, "r", encoding="utf-8") as fin, open(output_path, "w", encoding="utf-8") as fout:
         for line in fin:
             if line.startswith(">"):
                 fout.write(f">{contig_prefix}_contig_{contig_idx}\n")
@@ -136,6 +197,8 @@ def standardize_fasta_stream(input_path: str, output_path: str, contig_prefix: s
             s_upper = seq.upper()
             gc_count += s_upper.count("G") + s_upper.count("C")
             fout.write(line)
+    if contig_count == 0:
+        raise ValueError("no FASTA header found")
     gc_content = (gc_count / total_len * 100.0) if total_len > 0 else 0.0
     return total_len, contig_count, round(gc_content, 2)
 
@@ -429,6 +492,79 @@ def iter_input_genomes(source_dirs: List[str]) -> Iterable[InputGenome]:
                 yield InputGenome(source_folder=source_label, source_dir=s_dir, root=root, filename=f)
 
 
+def scan_input_sources(
+    source_dirs: List[str],
+    exclude_hidden: bool = True,
+    strict_fasta_check: bool = True,
+) -> Tuple[List[InputGenome], Dict[str, int], int, Dict[str, int], List[Dict[str, str]]]:
+    input_genomes: List[InputGenome] = []
+    counts: Dict[str, int] = {}
+    skipped_records: List[Dict[str, str]] = []
+    stats = {
+        "hidden_skipped": 0,
+        "invalid_fasta_skipped": 0,
+        "non_fasta_ignored": 0,
+        "fasta_detected_by_content": 0,
+    }
+    total = 0
+
+    for s_dir in source_dirs:
+        if not os.path.exists(s_dir):
+            continue
+        source_label = os.path.basename(os.path.normpath(s_dir))
+        source_count = 0
+        for root, _, files in os.walk(s_dir):
+            for f in files:
+                path = os.path.join(root, f)
+                category, reason = classify_input_file(
+                    path,
+                    exclude_hidden=exclude_hidden,
+                    strict_fasta_check=strict_fasta_check,
+                )
+                if category in {"fasta", "fasta_detected_by_content"}:
+                    input_genomes.append(
+                        InputGenome(source_folder=source_label, source_dir=s_dir, root=root, filename=f)
+                    )
+                    source_count += 1
+                    total += 1
+                    if category == "fasta_detected_by_content":
+                        stats["fasta_detected_by_content"] += 1
+                    continue
+                if category == "hidden_skipped":
+                    stats["hidden_skipped"] += 1
+                    skipped_records.append(
+                        {
+                            "Original_Path": path,
+                            "Original_Name": f,
+                            "Source_Folder": source_label,
+                            "Original_Subfolder": os.path.relpath(root, s_dir),
+                            "File_MD5": "",
+                            "Status": "Hidden_File_Skipped",
+                            "Matched_Previous_Name": "",
+                            "Reason": reason,
+                        }
+                    )
+                elif category == "invalid_fasta_skipped":
+                    stats["invalid_fasta_skipped"] += 1
+                    skipped_records.append(
+                        {
+                            "Original_Path": path,
+                            "Original_Name": f,
+                            "Source_Folder": source_label,
+                            "Original_Subfolder": os.path.relpath(root, s_dir),
+                            "File_MD5": "",
+                            "Status": "Invalid_FASTA_Skipped",
+                            "Matched_Previous_Name": "",
+                            "Reason": reason,
+                        }
+                    )
+                else:
+                    stats["non_fasta_ignored"] += 1
+        counts[source_label] = source_count
+
+    return input_genomes, counts, total, stats, skipped_records
+
+
 def discover_source_dirs(database_root: str) -> List[str]:
     dirs: List[str] = []
     if not os.path.isdir(database_root):
@@ -515,6 +651,18 @@ def main():
             "<project>/checkm2_database/ lookup."
         ),
     )
+    parser.add_argument(
+        "--exclude-hidden",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Whether to skip hidden files such as .DS_Store and AppleDouble ._* files. Default: enabled.",
+    )
+    parser.add_argument(
+        "--strict-fasta-check",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Validate FASTA format from file content during discovery, and also detect FASTA files without standard suffixes. Default: enabled.",
+    )
     args = parser.parse_args()
 
     start = _dt.datetime.now()
@@ -534,13 +682,27 @@ def main():
     if not source_dirs:
         raise SystemExit("Please provide --database-root or --sources.")
 
-    source_counts, total_input_found = count_fastas_by_source(source_dirs)
+    input_genomes, source_counts, total_input_found, discovery_stats, discovery_skips = scan_input_sources(
+        source_dirs,
+        exclude_hidden=args.exclude_hidden,
+        strict_fasta_check=args.strict_fasta_check,
+    )
     print("== Source FASTA Inventory ==")
     for source_name, count in source_counts.items():
         print(f"  {source_name}: {count}")
-    print(f"  Total: {total_input_found}")
+    print(f"  Total usable FASTA: {total_input_found}")
+    print("== Discovery Summary ==")
+    print(
+        "  Hidden/invalid FASTA skipped: "
+        f"{discovery_stats['hidden_skipped'] + discovery_stats['invalid_fasta_skipped']}"
+    )
+    print(f"  Hidden files skipped: {discovery_stats['hidden_skipped']}")
+    print(f"  Invalid FASTA skipped: {discovery_stats['invalid_fasta_skipped']}")
+    print(f"  FASTA detected by content: {discovery_stats['fasta_detected_by_content']}")
+    print(f"  Non-FASTA files ignored: {discovery_stats['non_fasta_ignored']}")
+    print(f"  Exclude hidden files: {args.exclude_hidden}")
+    print(f"  Strict FASTA check: {args.strict_fasta_check}")
 
-    input_genomes = list(iter_input_genomes(source_dirs))
     if not input_genomes:
         raise SystemExit("No fasta files found in the provided source folders.")
 
@@ -574,12 +736,30 @@ def main():
         # Mark carried-forward rows so a missing score is never mistaken for a real N/A.
         r.setdefault("Quality_Status", "carried_forward")
         r.setdefault("Quality_Message", "Inherited from previous version snapshot; not re-evaluated.")
-    scan_records: List[Dict[str, object]] = []
+    scan_records: List[Dict[str, object]] = list(discovery_skips)
     new_records: List[Dict[str, object]] = []
     os.makedirs(new_genomes_out_dir, exist_ok=True)
 
     total_items = len(input_genomes)
     for idx, item in enumerate(input_genomes, start=1):
+        if args.strict_fasta_check:
+            is_valid_text, invalid_reason = is_probable_text_fasta(item.path)
+            if not is_valid_text:
+                print(f"[{idx}/{total_items}] SKIP invalid FASTA: {item.path} ({invalid_reason})")
+                scan_records.append(
+                    {
+                        "Original_Path": item.path,
+                        "Original_Name": item.filename,
+                        "Source_Folder": item.source_folder,
+                        "Original_Subfolder": item.subfolder,
+                        "File_MD5": "",
+                        "Status": "Invalid_FASTA_Skipped",
+                        "Matched_Previous_Name": "",
+                        "Reason": invalid_reason,
+                    }
+                )
+                continue
+
         raw_md5 = compute_file_md5(item.path)
         if raw_md5 in previous_md5_map:
             prev_row = previous_md5_map[raw_md5]
@@ -608,7 +788,28 @@ def main():
         contig_prefix = os.path.splitext(new_filename)[0]
         qc_stage_path = os.path.join(new_genomes_out_dir, new_filename)
 
-        size_bp, contigs, gc = standardize_fasta_stream(item.path, out_path, contig_prefix)
+        try:
+            size_bp, contigs, gc = standardize_fasta_stream(item.path, out_path, contig_prefix)
+        except (UnicodeDecodeError, ValueError, OSError) as exc:
+            print(f"[{idx}/{total_items}] SKIP unreadable FASTA: {item.path} ({exc})")
+            try:
+                if os.path.exists(out_path):
+                    os.remove(out_path)
+            except OSError:
+                pass
+            scan_records.append(
+                {
+                    "Original_Path": item.path,
+                    "Original_Name": item.filename,
+                    "Source_Folder": item.source_folder,
+                    "Original_Subfolder": item.subfolder,
+                    "File_MD5": raw_md5,
+                    "Status": "Unreadable_FASTA_Skipped",
+                    "Matched_Previous_Name": "",
+                    "Reason": str(exc),
+                }
+            )
+            continue
         shutil.copy2(out_path, qc_stage_path)
 
         rrna_counts = {"5S": 0, "16S": 0, "23S": 0, "18S": 0, "28S": 0, "total": 0}
@@ -812,6 +1013,8 @@ def main():
     summary_lines.append(f"Threads: {args.threads}")
     summary_lines.append(f"Run CheckM2: {args.run_checkm2}")
     summary_lines.append(f"Run barrnap: {args.run_barrnap}")
+    summary_lines.append(f"Exclude hidden files: {args.exclude_hidden}")
+    summary_lines.append(f"Strict FASTA check: {args.strict_fasta_check}")
     if args.run_barrnap:
         summary_lines.append(f"barrnap kingdom: {args.barrnap_kingdom}")
     summary_lines.append(f"Database root: {args.database_root or ''}")
@@ -833,6 +1036,14 @@ def main():
     summary_lines.append("--- Input ---")
     summary_lines.append(f"Source folders: {len(source_dirs)}")
     summary_lines.append(f"Input genomes found: {len(input_genomes)}")
+    summary_lines.append(
+        "Hidden/invalid FASTA skipped: "
+        f"{discovery_stats['hidden_skipped'] + discovery_stats['invalid_fasta_skipped']}"
+    )
+    summary_lines.append(f"Hidden files skipped: {discovery_stats['hidden_skipped']}")
+    summary_lines.append(f"Invalid FASTA skipped: {discovery_stats['invalid_fasta_skipped']}")
+    summary_lines.append(f"FASTA detected by content: {discovery_stats['fasta_detected_by_content']}")
+    summary_lines.append(f"Non-FASTA files ignored: {discovery_stats['non_fasta_ignored']}")
     for source_name, count in source_counts.items():
         summary_lines.append(f"  - {source_name}: {count}")
     summary_lines.append("")
