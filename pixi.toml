@@ -1,0 +1,41 @@
+[workspace]
+channels = ["conda-forge", "bioconda"]
+name = "GTDB_renew"
+platforms = ["osx-arm64", "linux-64"]
+version = "0.2.0"
+
+[tasks]
+# Convenience entry points. `pixi run gttdb <subcommand> [args]` is the
+# recommended invocation. The shorter `pixi run build ...` and friends are
+# aliases that map to specific subcommands.
+gttdb = "python gttdb.py"
+build = "python gttdb.py build"
+download-gtdb = "python gttdb.py download-gtdb"
+run-all = "python gttdb.py run-all"
+# Direct entry points (for users that already know the module they want).
+db-builder = "python db_builder_cli.py"
+gtdb-downloader = "python gtdb_downloader.py"
+
+[dependencies]
+python = "3.12.*"
+pandas = ">=2.2,<3"
+requests = ">=2.31.0,<3"
+beautifulsoup4 = ">=4.12.0,<5"
+checkm2 = ">=1.1.0,<2"
+barrnap = ">=0.9,<1"
+# NCBI datasets CLI: bulk-downloads RefSeq/GenBank assemblies by accession.
+# bioconda provides ``ncbi-datasets-cli``; conda-forge provides ``ncbi-datasets-cli`` too.
+ncbi-datasets-cli = ">=18.30.1,<19"
+# Streaming big gz/tar archives on Linux/macOS; keep as explicit
+# dependency so downstream distros don't break on minimal images.
+tqdm = ">=4.66,<5"
+
+# ----------------------------------------------------------------------------
+# Notes for Linux users
+# ----------------------------------------------------------------------------
+# * On Linux 64-bit the same `pixi install` resolves the project, but CheckM2's
+#   Python 3.12 multiprocessing pickling bug also affects linux-64. The
+#   project-local `checkm2_compat/sitecustomize.py` and the in-place patch
+#   to `site-packages/checkm2/predictQuality.py` apply on both platforms.
+# * DIAMOND on linux-64 is provided by bioconda; the rep tar is streamed
+#   through `gzip -dc`/tarfile in pure Python so no system tar is required.

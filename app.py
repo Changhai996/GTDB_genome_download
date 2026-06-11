@@ -1,5 +1,7 @@
 import os
 import re
+import hashlib
+import unicodedata
 import pandas as pd
 import streamlit as st
 import platform
@@ -224,13 +226,13 @@ def clean_and_rename_genomes(input_dirs, output_main_dir):
                 break
         
         original_name = best_file['name']
-        new_filename = original_name
+        name_part, _ = os.path.splitext(original_name)
+        new_filename = f"{name_part}.fna"
         counter = 1
         
         # Prevent filename collisions if different genomes somehow have the same name
         while new_filename in used_filenames:
-            name_part, ext_part = os.path.splitext(original_name)
-            new_filename = f"{name_part}_{counter}{ext_part}"
+            new_filename = f"{name_part}_{counter}.fna"
             counter += 1
             
         used_filenames.add(new_filename)
@@ -264,6 +266,138 @@ def get_tool_path(tool_name):
         
     return None
 
+def run_checkm2(input_dir, output_dir, threads=4, status_text=None):
+    """
+    Run CheckM2 on a directory of genomes to assess Completeness and Contamination.
+    Returns a dictionary mapping genome filename to a dictionary of metrics:
+    {'score': GTDB_Score, 'completeness': Completeness, 'contamination': Contamination}
+    """
+    checkm2_path = get_tool_path("checkm2")
+    if not checkm2_path:
+        if status_text:
+            status_text.warning("CheckM2 is not found. Proceeding without quality-based selection.")
+        return {}
+        
+    if status_text:
+        status_text.info(f"Running CheckM2 on genomes in {input_dir}... This may take some time.")
+        
+    os.makedirs(output_dir, exist_ok=True)
+    log_file = os.path.join(output_dir, "checkm2.log")
+    cmd = [checkm2_path, "predict", "--threads", str(threads), "--input", input_dir, "--output-directory", output_dir, "-x", "fna", "--force"]
+    
+    try:
+        with open(log_file, "w") as f:
+            subprocess.run(cmd, check=True, stdout=f, stderr=subprocess.STDOUT)
+    except subprocess.CalledProcessError as e:
+        if status_text:
+            status_text.warning("CheckM2 execution failed. Proceeding without quality-based selection.")
+        st.warning(f"⚠️ CheckM2 encountered an error. Check log for details: `{log_file}`")
+        return {}
+        
+    report_file = os.path.join(output_dir, "quality_report.tsv")
+    scores = {}
+    if os.path.exists(report_file):
+        try:
+            df_q = pd.read_csv(report_file, sep='\t')
+            for _, row in df_q.iterrows():
+                name = str(row['Name'])
+                # checkm2 outputs 'Name' without extension usually
+                if not name.endswith('.fna'):
+                    name = name + '.fna'
+                comp = float(row.get('Completeness', 0))
+                contam = float(row.get('Contamination', 100))
+                score = comp - 5 * contam
+                scores[name] = {
+                    'score': score,
+                    'completeness': comp,
+                    'contamination': contam
+                }
+        except Exception as e:
+            if status_text:
+                status_text.warning(f"Failed to parse CheckM2 report: {e}")
+    return scores
+
+def parse_barrnap_gff(gff_path):
+    counts = {"5S": 0, "16S": 0, "23S": 0, "18S": 0, "28S": 0}
+    if not os.path.exists(gff_path):
+        return {**counts, "total": 0}
+    try:
+        with open(gff_path, "r") as f:
+            for line in f:
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.strip().split("\t")
+                if len(parts) < 9:
+                    continue
+                attrs = parts[8]
+                if "5S" in attrs:
+                    counts["5S"] += 1
+                if "16S" in attrs:
+                    counts["16S"] += 1
+                if "23S" in attrs:
+                    counts["23S"] += 1
+                if "18S" in attrs:
+                    counts["18S"] += 1
+                if "28S" in attrs:
+                    counts["28S"] += 1
+    except Exception:
+        pass
+    total = sum(counts.values())
+    return {**counts, "total": total}
+
+def run_barrnap(genome_fna, output_gff, output_rrna_fasta=None, kingdom="bac", threads=1, status_text=None):
+    barrnap_path = get_tool_path("barrnap")
+    if not barrnap_path:
+        if status_text:
+            status_text.warning("barrnap is not found. Skipping rRNA extraction.")
+        return None
+    os.makedirs(os.path.dirname(output_gff), exist_ok=True)
+    log_file = output_gff + ".log"
+    cmd = [barrnap_path, "--kingdom", kingdom, "--threads", str(int(threads)), genome_fna]
+    if output_rrna_fasta:
+        cmd = [barrnap_path, "--kingdom", kingdom, "--threads", str(int(threads)), "--outseq", output_rrna_fasta, genome_fna]
+    try:
+        with open(output_gff, "w") as gf, open(log_file, "w") as lf:
+            subprocess.run(cmd, check=True, stdout=gf, stderr=lf)
+    except subprocess.CalledProcessError:
+        if status_text:
+            status_text.warning(f"barrnap failed for: {os.path.basename(genome_fna)}")
+        return None
+    return output_gff
+
+def calculate_genome_stats(filepath):
+    """
+    Calculate basic genome statistics: Size (bp), Contig Count, and GC Content (%).
+    """
+    try:
+        with open(filepath, 'r') as f:
+            lines = f.readlines()
+            
+        contig_count = 0
+        total_len = 0
+        gc_count = 0
+        
+        for line in lines:
+            line = line.strip()
+            if line.startswith('>'):
+                contig_count += 1
+            else:
+                total_len += len(line)
+                gc_count += line.upper().count('G') + line.upper().count('C')
+                
+        gc_content = (gc_count / total_len * 100) if total_len > 0 else 0
+        return {
+            'Genome_Size_bp': total_len,
+            'Contig_Count': contig_count,
+            'GC_Content_%': round(gc_content, 2)
+        }
+    except Exception as e:
+        return {
+            'Genome_Size_bp': 0,
+            'Contig_Count': 0,
+            'GC_Content_%': 0.0
+        }
+
 def install_tools_via_pixi(status_container):
     """Installs required tools (FastANI, Mash) via Pixi in the background."""
     pixi_home = os.path.join(os.getcwd(), ".pixi")
@@ -275,16 +409,17 @@ def install_tools_via_pixi(status_container):
         cmd_install_pixi = f"export PIXI_HOME={pixi_home} && curl -fsSL https://pixi.sh/install.sh | bash"
         subprocess.run(cmd_install_pixi, shell=True, check=True, capture_output=True)
         
-    status_container.info("Installing FastANI and Mash via Pixi...")
-    cmd_install_tools = f"export PIXI_HOME={pixi_home} && {pixi_bin} global install fastani mash -c bioconda -c conda-forge"
+    status_container.info("Installing FastANI, Mash, and CheckM2 via Pixi...")
+    cmd_install_tools = f"export PIXI_HOME={pixi_home} && {pixi_bin} global install fastani mash checkm2 -c bioconda -c conda-forge"
     subprocess.run(cmd_install_tools, shell=True, check=True, capture_output=True)
     
     return os.path.join(pixi_home, "bin", "fastANI"), os.path.join(pixi_home, "bin", "mash")
 
-def run_fastani_dereplication(input_dir, output_dir, fastani_path, mash_path=None, use_mash=True, ani_threshold=99.9, af_threshold=60.0, threads=4, status_text=None):
+def run_fastani_dereplication(input_dir, output_dir, fastani_path, mash_path=None, use_mash=True, ani_threshold=99.9, af_threshold=60.0, threads=4, status_text=None, checkm2_scores=None):
     """
     Run FastANI to identify sequence-level duplicates.
     If use_mash is True, uses MASH to pre-filter highly similar genome pairs to speed up FastANI.
+    Uses checkm2_scores to select the best representative from each cluster.
     """
     if os.path.exists(output_dir):
         shutil.rmtree(output_dir)
@@ -441,9 +576,21 @@ def run_fastani_dereplication(input_dir, output_dir, fastani_path, mash_path=Non
             cluster_map[root].append(g)
             
         report = []
+        if checkm2_scores is None:
+            checkm2_scores = {}
+            
         for root, members in cluster_map.items():
-            # Sort to pick the best representative (e.g. shortest name or containing GCA)
-            members.sort(key=lambda x: (0 if re.search(r'GC[AF]_', x) else 1, len(x)))
+            # Sort to pick the best representative
+            # Primary: GTDB score from checkm2
+            # Secondary: shortest name or containing GCA
+            def get_sort_key(x):
+                basename = os.path.basename(x)
+                score_info = checkm2_scores.get(basename, {})
+                score = score_info.get('score', -9999) if isinstance(score_info, dict) else -9999
+                is_gca = 0 if re.search(r'GC[AF]_', x) else 1
+                return (-score, is_gca, len(x))
+                
+            members.sort(key=get_sort_key)
             rep = members[0]
             shutil.copy2(rep, os.path.join(output_dir, os.path.basename(rep)))
             
@@ -571,7 +718,7 @@ if df.empty:
 
 versions = sorted(df['Version'].unique())
 
-tab1, tab2, tab3, tab4 = st.tabs(["🔍 Single Version Explorer", "📊 Version Comparison", "📥 Custom Download", "📦 Dataset Updater"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["🔍 Single Version Explorer", "📊 Version Comparison", "📥 Custom Download", "📦 Dataset Updater", "🗄️ Database Builder"])
 
 with tab1:
     st.header("Single Version Explorer")
@@ -816,11 +963,12 @@ with tab4:
     - **Alignment Fraction (AF)**: Calculated as `(matches / total) * 100`. It represents the coverage of the alignment.
     
     **Pipeline Workflow:**
-    This one-click pipeline performs a strict species-level comparison:
-    1. **Physical Cleaning**: Deduplicates identical local files based on MD5 hashing.
-    2. **Local Dereplication**: Clusters your local genomes into **Unique Species** (Local Representatives) using FastANI & MASH.
-    3. **GTDB Auto-Fetch**: Automatically identifies and downloads the **Species Representatives** for your specified GTDB Taxon.
-    4. **Species vs Species Comparison**: Compares your Local Species against the GTDB Species to reveal overlapping and novel species.
+    This one-click pipeline performs a strict species-level integration:
+    1. **Data Gathering**: Collects genomes from your local folders and fetches the specified GTDB Taxon representatives.
+    2. **Combination**: Merges Local and GTDB genomes into a single unified pool.
+    3. **Quality Assessment**: Runs CheckM2 to evaluate Completeness and Contamination (GTDB Score) for the combined pool.
+    4. **Dereplication**: Clusters the combined genomes into **Unique Species** using FastANI & MASH, picking the highest quality genome (from either GTDB or Local) per cluster.
+    5. **Final Output**: Saves the unified representative genomes and generates a comprehensive quality report detailing their origin.
     """)
     
     with st.expander("Pipeline Configuration", expanded=True):
@@ -835,27 +983,23 @@ with tab4:
         with col_d2:
             derep_af_thresh = st.slider("Local Species AF Threshold (%)", min_value=10.0, max_value=100.0, value=65.0, step=1.0, help="Typically 65% coverage for robust species definition.")
             
-        st.markdown("##### 🌍 GTDB Target (For Comparison)")
+        st.markdown("##### 🌍 GTDB Target (To merge with local dataset)")
         col_g1, col_g2 = st.columns(2)
         with col_g1:
             gtdb_comp_version = st.selectbox("GTDB Version", versions, index=len(versions)-1, key="gtdb_comp_v")
         with col_g2:
             gtdb_comp_taxon = st.text_input("GTDB Taxon to compare against:", "c__Bathyarchaeia", key="gtdb_comp_t")
             
-        st.markdown("##### ⚖️ Comparison Matching Rules")
-        col_c1, col_c2 = st.columns(2)
-        with col_c1:
-            comp_ani_thresh = st.slider("Comparison Match ANI Threshold (%)", min_value=80.0, max_value=100.0, value=95.0, step=0.1)
-        with col_c2:
-            comp_af_thresh = st.slider("Comparison Match AF Threshold (%)", min_value=10.0, max_value=100.0, value=65.0, step=1.0)
-            
         st.markdown("##### ⚙️ Compute Settings")
-        col_m1, col_m2 = st.columns(2)
+        col_m1, col_m2, col_m3 = st.columns(3)
         with col_m1:
-            threads = st.number_input("Threads to use for FastANI & MASH", min_value=1, max_value=64, value=4)
+            threads = st.number_input("Threads to use for FastANI & MASH & CheckM2", min_value=1, max_value=64, value=4)
         with col_m2:
             st.markdown("<br>", unsafe_allow_html=True)
             use_mash_pipe = st.checkbox("Use MASH pre-filtering (Highly Recommended)", value=True)
+        with col_m3:
+            st.markdown("<br>", unsafe_allow_html=True)
+            run_checkm2_pipe = st.checkbox("Run CheckM2 Quality Assessment", value=True, help="Selects the highest quality genome as the representative for each species cluster.")
             
     if st.button("Run Full Species-Level Analysis"):
         input_dirs = [d.strip() for d in input_dirs_raw.split('\n') if d.strip()]
@@ -866,50 +1010,78 @@ with tab4:
         else:
             status_container = st.empty()
             
-            # --- Sub-step A: Fetch GTDB Representatives ---
-            status_container.info(f"Step A: Retrieving GTDB Representatives for {gtdb_comp_taxon} (R{gtdb_comp_version})...")
-            df_gtdb = df[(df['Version'] == gtdb_comp_version) & (df['Taxonomy'].str.contains(gtdb_comp_taxon, na=False))]
-            if df_gtdb.empty:
-                st.error(f"No genomes found for {gtdb_comp_taxon} in GTDB R{gtdb_comp_version}.")
-                st.stop()
-                
-            df_gtdb['Is_Representative'] = 'No'
-            rep_idx = df_gtdb.drop_duplicates(subset=['Species']).index
-            df_gtdb.loc[rep_idx, 'Is_Representative'] = 'Yes'
-            reps_list = df_gtdb[df_gtdb['Is_Representative'] == 'Yes']['Genome_ID'].tolist()
-            
-            safe_name = re.sub(r'[^a-zA-Z0-9_]', '_', gtdb_comp_taxon)
-            gtdb_dir = f"ncbi_downloads/{safe_name}_R{gtdb_comp_version}_reps"
-            os.makedirs(gtdb_dir, exist_ok=True)
-            
-            downloaded = get_downloaded_accessions(gtdb_dir)
-            missing = [acc for acc in reps_list if acc.replace("RS_", "").replace("GB_", "") not in downloaded and acc not in downloaded]
-            
-            if missing:
-                status_container.info(f"Step A: Downloading {len(missing)} missing GTDB Representative Genomes via NCBI Datasets...")
-                if ensure_datasets_cli():
-                    p_bar = st.progress(0)
-                    succ, msg, s_list, f_list = download_genomes(reps_list, gtdb_dir, progress_bar=p_bar, status_text=status_container)
-                    p_bar.empty()
-                    if not succ:
-                        st.warning(msg)
-                else:
-                    st.error("NCBI Datasets CLI could not be installed.")
-                    st.stop()
-            else:
-                status_container.info(f"Step A: All {len(reps_list)} GTDB Representative Genomes are already downloaded locally.")
-                
-            # --- Sub-step B: Physical Cleaning ---
+            # --- Sub-step A: Physical Cleaning of Local Genomes ---
             combined_out = f"local_datasets/{output_name}/1_raw_combined"
-            derep_out = f"local_datasets/{output_name}/2_dereplicated_genomes"
-            status_container.info("Step B: Physical Hashing and Cleaning of local genomes...")
+            derep_out = f"local_datasets/{output_name}/2_final_representatives"
+            status_container.info("Step A: Physical Hashing and Cleaning of local genomes...")
             report_df = clean_and_rename_genomes(input_dirs, combined_out)
             
             if report_df.empty:
-                st.warning("No genome files (.fna, .fasta, .fa) found in the provided directories.")
+                st.warning("No genome files (.fna, .fasta, .fa) found in the provided local directories. Will attempt to proceed with GTDB only if available.")
+            
+            source_map = {}
+            if os.path.exists(combined_out):
+                for f in os.listdir(combined_out):
+                    if f.endswith(('.fna', '.fasta', '.fa')):
+                        source_map[f] = "Local Dataset"
+            
+            # --- Sub-step B: Fetch GTDB Representatives ---
+            status_container.info(f"Step B: Retrieving GTDB Representatives for {gtdb_comp_taxon} (R{gtdb_comp_version})...")
+            df_gtdb = df[(df['Version'] == gtdb_comp_version) & (df['Taxonomy'].str.contains(gtdb_comp_taxon, na=False))]
+            if df_gtdb.empty:
+                st.warning(f"No genomes found for {gtdb_comp_taxon} in GTDB R{gtdb_comp_version}. Proceeding with local only.")
+            else:
+                df_gtdb['Is_Representative'] = 'No'
+                rep_idx = df_gtdb.drop_duplicates(subset=['Species']).index
+                df_gtdb.loc[rep_idx, 'Is_Representative'] = 'Yes'
+                reps_list = df_gtdb[df_gtdb['Is_Representative'] == 'Yes']['Genome_ID'].tolist()
+                
+                safe_name = re.sub(r'[^a-zA-Z0-9_]', '_', gtdb_comp_taxon)
+                gtdb_dir = f"ncbi_downloads/{safe_name}_R{gtdb_comp_version}_reps"
+                os.makedirs(gtdb_dir, exist_ok=True)
+                
+                downloaded = get_downloaded_accessions(gtdb_dir)
+                missing = [acc for acc in reps_list if acc.replace("RS_", "").replace("GB_", "") not in downloaded and acc not in downloaded]
+                
+                if missing:
+                    status_container.info(f"Step B: Downloading {len(missing)} missing GTDB Representative Genomes via NCBI Datasets...")
+                    if ensure_datasets_cli():
+                        p_bar = st.progress(0)
+                        succ, msg, s_list, f_list = download_genomes(reps_list, gtdb_dir, progress_bar=p_bar, status_text=status_container)
+                        p_bar.empty()
+                        if not succ:
+                            st.warning(msg)
+                    else:
+                        st.error("NCBI Datasets CLI could not be installed.")
+                        st.stop()
+                else:
+                    status_container.info(f"Step B: All GTDB Representative Genomes are already downloaded locally.")
+                    
+                status_container.info("Merging GTDB genomes into the combined pool...")
+                os.makedirs(combined_out, exist_ok=True)
+                for f_name in os.listdir(gtdb_dir):
+                    if f_name.endswith(('.fna', '.fasta', '.fa')):
+                        src = os.path.join(gtdb_dir, f_name)
+                        name_part, _ = os.path.splitext(f_name)
+                        dst_name = f"{name_part}.fna"
+                        
+                        counter = 1
+                        final_dst_name = dst_name
+                        while final_dst_name in source_map and source_map[final_dst_name] == "Local Dataset":
+                            final_dst_name = f"{name_part}_GTDB_{counter}.fna"
+                            counter += 1
+                            
+                        dst = os.path.join(combined_out, final_dst_name)
+                        if not os.path.exists(dst):
+                            import shutil
+                            shutil.copy2(src, dst)
+                        source_map[final_dst_name] = "GTDB"
+                        
+            if not source_map:
+                st.error("No genomes found from either local directories or GTDB. Analysis stopped.")
                 st.stop()
                 
-            # --- Sub-step C: Local Dereplication ---
+            # --- Sub-step C: Tools and CheckM2 ---
             fastani_path = get_tool_path("fastANI")
             mash_path = get_tool_path("mash")
             
@@ -921,68 +1093,344 @@ with tab4:
                         st.error(f"Failed to install tools: {e}")
                         st.stop()
                         
-            status_container.info(f"Step C: Dereplicating local genomes into Species (ANI {derep_ani_thresh}%, AF {derep_af_thresh}%)...")
+            if run_checkm2_pipe:
+                checkm2_out = f"local_datasets/{output_name}/checkm2_results"
+                status_container.info("Step C: Running CheckM2 on combined dataset for Quality Assessment...")
+                checkm2_scores = run_checkm2(combined_out, checkm2_out, threads=threads, status_text=status_container)
+                
+                if checkm2_scores:
+                    st.success(f"CheckM2 completed. Scored {len(checkm2_scores)} genomes.")
+                    scores_list = []
+                    for g, metrics in checkm2_scores.items():
+                        if isinstance(metrics, dict):
+                            scores_list.append({
+                                'Genome': g,
+                                'GTDB_Score': metrics.get('score', 'N/A'),
+                                'Completeness': metrics.get('completeness', 'N/A'),
+                                'Contamination': metrics.get('contamination', 'N/A')
+                            })
+                    if scores_list:
+                        scores_df = pd.DataFrame(scores_list)
+                        scores_df.to_csv(f"local_datasets/{output_name}/combined_genome_scores.csv", index=False)
+            else:
+                checkm2_scores = {}
+                        
+            # --- Sub-step D: Dereplication on Combined Pool ---
+            status_container.info(f"Step D: Dereplicating Combined Genomes into Final Species Representatives (ANI {derep_ani_thresh}%, AF {derep_af_thresh}%)...")
             dup_report = run_fastani_dereplication(
                 combined_out, derep_out, fastani_path, mash_path=mash_path, use_mash=use_mash_pipe, 
-                ani_threshold=derep_ani_thresh, af_threshold=derep_af_thresh, threads=threads, status_text=status_container
-            )
-            
-            # --- Sub-step D: Compare Local Species vs GTDB Species ---
-            status_container.info("Step D: Running Species vs Species Comparison...")
-            df_match = run_fastani_comparison(
-                derep_out, gtdb_dir, fastani_path, mash_path=mash_path, use_mash=use_mash_pipe, 
-                ani_threshold=comp_ani_thresh, af_threshold=comp_af_thresh, threads=threads, status_text=status_container
+                ani_threshold=derep_ani_thresh, af_threshold=derep_af_thresh, threads=threads, status_text=status_container,
+                checkm2_scores=checkm2_scores
             )
             
             status_container.empty()
             
             # --- Sub-step E: Render Results ---
-            if df_match is not None:
-                st.success("🎉 Species-Level Analysis Complete!")
-                
-                local_reps = set([f for f in os.listdir(derep_out) if f.endswith(('.fna', '.fasta', '.fa'))])
-                gtdb_reps = set([f for f in os.listdir(gtdb_dir) if f.endswith(('.fna', '.fasta', '.fa'))])
-                
-                matched_local = set(df_match['query_name']) if not df_match.empty else set()
-                matched_gtdb = set(df_match['ref_name']) if not df_match.empty else set()
-                
-                novel_local = local_reps - matched_local
-                missing_gtdb = gtdb_reps - matched_gtdb
-                
-                st.markdown("### Species Comparison Summary")
-                st.markdown("This strictly compares **Unique Local Species** against **GTDB Representative Species**.")
-                
-                col_r1, col_r2, col_r3, col_r4 = st.columns(4)
-                col_r1.metric("Local Unique Species", len(local_reps))
-                col_r2.metric("GTDB Unique Species", len(gtdb_reps))
-                col_r3.metric("Shared Species (Overlap)", len(matched_local))
-                col_r4.metric("Novel Local Species", len(novel_local))
-                
-                c_tab1, c_tab2, c_tab3, c_tab4 = st.tabs(["🏠 Novel Local Species", "🌍 Missing GTDB Species", "🤝 Shared Species", "🗑️ Local Duplicates Removed"])
-                
-                with c_tab1:
-                    st.write(f"**{len(novel_local)}** novel species found in your dataset that are not in GTDB R{gtdb_comp_version}:")
-                    st.dataframe(pd.DataFrame({"Novel_Local_Species_File": list(novel_local)}))
+            st.success("🎉 Combined Species-Level Integration Complete!")
+            
+            final_reps = [f for f in os.listdir(derep_out) if f.endswith(('.fna', '.fasta', '.fa'))]
+            
+            st.markdown("### Combined Analysis Summary")
+            
+            local_count = sum(1 for v in source_map.values() if v == "Local Dataset")
+            gtdb_count = sum(1 for v in source_map.values() if v == "GTDB")
+            
+            final_local_reps = sum(1 for f in final_reps if source_map.get(f) == "Local Dataset")
+            final_gtdb_reps = sum(1 for f in final_reps if source_map.get(f) == "GTDB")
+            
+            col_r1, col_r2, col_r3, col_r4 = st.columns(4)
+            col_r1.metric("Total Local Input", local_count)
+            col_r2.metric("Total GTDB Input", gtdb_count)
+            col_r3.metric("Final Local Reps", final_local_reps)
+            col_r4.metric("Final GTDB Reps", final_gtdb_reps)
+            
+            c_tab1, c_tab2 = st.tabs(["🌟 Final Representatives (Combined)", "🗑️ Deduplication Details"])
+            
+            with c_tab1:
+                st.write("List of Final Combined Representative Genomes and their Statistics & Quality Scores:")
+                rep_scores = []
+                for rep in final_reps:
+                    rep_path = os.path.join(derep_out, rep)
+                    stats = calculate_genome_stats(rep_path)
                     
-                with c_tab2:
-                    st.write(f"**{len(missing_gtdb)}** species in GTDB R{gtdb_comp_version} that you haven't collected locally:")
-                    st.dataframe(pd.DataFrame({"Missing_GTDB_Species_File": list(missing_gtdb)}))
-                    
-                with c_tab3:
-                    st.write(f"**{len(df_match)}** match relationships between your local species and GTDB species:")
-                    if not df_match.empty:
-                        st.dataframe(df_match[['query_name', 'ref_name', 'ani', 'af', 'matches', 'total']])
+                    score_info = checkm2_scores.get(rep, {}) if 'checkm2_scores' in locals() else {}
+                    if isinstance(score_info, dict):
+                        score = score_info.get('score', "N/A")
+                        comp = score_info.get('completeness', "N/A")
+                        contam = score_info.get('contamination', "N/A")
                     else:
-                        st.info("No overlap found.")
+                        score, comp, contam = "N/A", "N/A", "N/A"
                         
-                with c_tab4:
-                    st.write("These genomes were identified as duplicates and merged into their respective Local Species Representatives:")
-                    total_files = report_df['Original_Count'].sum()
-                    st.write(f"- Total Initial Files: {total_files}")
-                    st.write(f"- Exact MD5 Duplicates Removed: {total_files - len(report_df)}")
-                    st.write(f"- Sequence Duplicates Removed (ANI/AF): {len(dup_report) if not dup_report.empty else 0}")
-                    if not dup_report.empty:
-                        st.dataframe(dup_report)
-            else:
-                st.error("Comparison failed or one of the directories contained no fasta files.")
+                    source = source_map.get(rep, "Unknown")
+                        
+                    rep_scores.append({
+                        "Representative_Genome": rep, 
+                        "Source": source,
+                        "Genome_Size_bp": stats['Genome_Size_bp'],
+                        "Contig_Count": stats['Contig_Count'],
+                        "GC_Content_%": stats['GC_Content_%'],
+                        "GTDB_Score": score,
+                        "Completeness": comp,
+                        "Contamination": contam
+                    })
+                rep_df = pd.DataFrame(rep_scores)
+                st.dataframe(rep_df)
+                
+                rep_csv_path = f"local_datasets/{output_name}/final_combined_representatives_list.csv"
+                rep_df.to_csv(rep_csv_path, index=False)
+                st.success(f"Representative genome files are saved in: `{os.path.abspath(derep_out)}`")
+                st.success(f"Representative list saved to: `{os.path.abspath(rep_csv_path)}`")
+                
+                import datetime
+                log_content = []
+                log_content.append("="*50)
+                log_content.append("GTDB Renew - Dataset Integration & Dereplication Report")
+                log_content.append(f"Time: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+                log_content.append("="*50)
+                log_content.append("")
+                log_content.append("--- Parameters ---")
+                log_content.append(f"GTDB Version: R{gtdb_comp_version}")
+                log_content.append(f"GTDB Target Taxon: {gtdb_comp_taxon}")
+                log_content.append(f"ANI Threshold: {derep_ani_thresh}%")
+                log_content.append(f"AF Threshold: {derep_af_thresh}%")
+                log_content.append(f"Use MASH for fast prescreening: {use_mash_pipe}")
+                log_content.append(f"Run CheckM2 Quality Assessment: {run_checkm2_pipe}")
+                log_content.append(f"Threads: {threads}")
+                log_content.append("")
+                log_content.append("--- Input Statistics ---")
+                log_content.append(f"Total Local Genomes (after MD5 cleaning): {local_count}")
+                log_content.append(f"Total GTDB Genomes: {gtdb_count}")
+                log_content.append(f"Total Combined Pool: {local_count + gtdb_count}")
+                log_content.append("")
+                log_content.append("--- Deduplication Statistics ---")
+                md5_dups = report_df['Original_Count'].sum() - len(report_df) if not report_df.empty else 0
+                seq_dups = len(dup_report) if not dup_report.empty else 0
+                log_content.append(f"Exact MD5 Local Duplicates Removed: {md5_dups}")
+                log_content.append(f"Sequence Duplicates Removed (ANI/AF): {seq_dups}")
+                log_content.append("")
+                log_content.append("--- Final Representatives Statistics ---")
+                log_content.append(f"Final Total Representatives: {len(final_reps)}")
+                log_content.append(f"  - From Local Dataset: {final_local_reps}")
+                log_content.append(f"  - From GTDB: {final_gtdb_reps}")
+                log_content.append("="*50)
+                
+                log_file_path = f"local_datasets/{output_name}/pipeline_summary.log"
+                with open(log_file_path, "w") as lf:
+                    lf.write("\n".join(log_content))
+                st.success(f"Detailed pipeline log saved to: `{os.path.abspath(log_file_path)}`")
+                
+            with c_tab2:
+                st.write("These genomes were identified as duplicates and merged into their respective Species Representatives:")
+                st.write(f"- Exact MD5 Local Duplicates Removed: {report_df['Original_Count'].sum() - len(report_df) if not report_df.empty else 0}")
+                st.write(f"- Sequence Duplicates Removed (ANI/AF) Across Pool: {len(dup_report) if not dup_report.empty else 0}")
+                if not dup_report.empty:
+                    st.dataframe(dup_report)
 
+def sanitize_token(text, max_len, fallback_prefix):
+    raw = text if text is not None else ""
+    ascii_text = unicodedata.normalize("NFKD", str(raw)).encode("ascii", "ignore").decode("ascii")
+    cleaned = re.sub(r"[^A-Za-z0-9]+", "_", ascii_text)
+    cleaned = re.sub(r"_+", "_", cleaned).strip("_")
+    digest = hashlib.md5(str(raw).encode("utf-8", errors="ignore")).hexdigest()[:8]
+    if not cleaned:
+        cleaned = f"{fallback_prefix}_{digest}"
+    if len(cleaned) > max_len:
+        cleaned = f"{cleaned[:max_len-9]}_{digest}"
+    return cleaned
+
+def ensure_unique_filename(output_dir, base_name, ext):
+    candidate = f"{base_name}{ext}"
+    if not os.path.exists(os.path.join(output_dir, candidate)):
+        return candidate
+    idx = 2
+    while True:
+        suffix = f"_{idx}"
+        trimmed = base_name
+        if len(trimmed) + len(suffix) > 120:
+            trimmed = trimmed[:120 - len(suffix)]
+        candidate = f"{trimmed}{suffix}{ext}"
+        if not os.path.exists(os.path.join(output_dir, candidate)):
+            return candidate
+        idx += 1
+
+def is_fasta_file(filename):
+    return filename.lower().endswith((".fna", ".fa", ".fasta"))
+
+def standardize_genome(input_path, output_path, prefix):
+    with open(input_path, 'r') as fin, open(output_path, 'w') as fout:
+        contig_idx = 1
+        for line in fin:
+            if line.startswith('>'):
+                fout.write(f">{prefix}_contig_{contig_idx}\n")
+                contig_idx += 1
+            else:
+                fout.write(line)
+
+with tab5:
+    st.header("🗄️ Database Builder & Version Management")
+    st.markdown("""
+    Build a centralized, standardized database from multiple genome sources. 
+    This module will:
+    1. Collect genomes from different source folders.
+    2. Standardize file names and internal sequence headers (`>Source_GenomeName_contig_X`).
+    3. Run CheckM2 to extract Completeness and Contamination.
+    4. Calculate basic genome statistics (Size, GC%, Contigs).
+    5. Generate a versioned metadata report.
+    """)
+    
+    with st.expander("Database Configuration", expanded=True):
+        db_name = st.text_input("Database Name:", "Bathyarchaeia_DB")
+        db_version = st.text_input("Database Version:", "v1.0")
+        
+        source_dirs_raw = st.text_area(
+            "Input Source Folders (one path per line):", 
+            help="The name of the folder will be used as the 'Source' label.\nExample:\n/path/to/DeepSea_Samples\n/path/to/HotSpring_Samples"
+        )
+        
+        threads_db = st.number_input("Threads for Quality Assessment", min_value=1, max_value=64, value=8, key="db_threads")
+        run_barrnap_db = st.checkbox("Run barrnap rRNA prediction", value=True)
+        barrnap_kingdom = st.selectbox("barrnap Kingdom", ["bac", "arc", "euk", "mito"], index=0)
+        
+    if st.button("Build Database & Extract Info", type="primary"):
+        source_dirs = [d.strip() for d in source_dirs_raw.split('\n') if d.strip()]
+        if not source_dirs:
+            st.error("Please provide at least one input source directory.")
+        else:
+            status_container = st.empty()
+            
+            # Setup output directories
+            base_out_dir = f"local_databases/{db_name}_{db_version}"
+            genomes_out_dir = os.path.join(base_out_dir, "genomes")
+            checkm2_out_dir = os.path.join(base_out_dir, "checkm2_results")
+            barrnap_out_dir = os.path.join(base_out_dir, "barrnap_results")
+            
+            os.makedirs(genomes_out_dir, exist_ok=True)
+            os.makedirs(barrnap_out_dir, exist_ok=True)
+            
+            # 1. Standardize and Copy Genomes
+            status_container.info("Step 1: Standardizing file names and internal sequence headers...")
+            
+            genome_records = []
+            
+            for s_dir in source_dirs:
+                if not os.path.exists(s_dir):
+                    st.warning(f"Directory not found: {s_dir}")
+                    continue
+                    
+                source_label = os.path.basename(os.path.normpath(s_dir))
+                safe_source_label = sanitize_token(source_label, 32, "SOURCE")
+                
+                for root, _, files in os.walk(s_dir):
+                    for f_name in files:
+                        if not is_fasta_file(f_name):
+                            continue
+                        input_path = os.path.join(root, f_name)
+                        original_name, _ = os.path.splitext(f_name)
+                        
+                        safe_orig_name = sanitize_token(original_name, 80, "GENOME")
+                        prefix_base = f"{safe_source_label}_{safe_orig_name}"
+                        prefix = sanitize_token(prefix_base, 100, "GENOME")
+                        new_filename = ensure_unique_filename(genomes_out_dir, prefix, ".fna")
+                        output_path = os.path.join(genomes_out_dir, new_filename)
+                        contig_prefix = os.path.splitext(new_filename)[0]
+                        
+                        # Standardize sequences
+                        standardize_genome(input_path, output_path, contig_prefix)
+                        
+                        # Calculate basic stats on the standardized file
+                        stats = calculate_genome_stats(output_path)
+                        rrna_counts = {"5S": 0, "16S": 0, "23S": 0, "18S": 0, "28S": 0, "total": 0}
+                        rrna_gff = ""
+                        rrna_fasta = ""
+                        if run_barrnap_db:
+                            rrna_gff_path = os.path.join(barrnap_out_dir, f"{contig_prefix}.gff")
+                            rrna_fasta_path = os.path.join(barrnap_out_dir, f"{contig_prefix}_rrna.fasta")
+                            gff_out = run_barrnap(output_path, rrna_gff_path, output_rrna_fasta=rrna_fasta_path, kingdom=barrnap_kingdom, threads=threads_db, status_text=status_container)
+                            if gff_out:
+                                rrna_counts = parse_barrnap_gff(gff_out)
+                                rrna_gff = os.path.relpath(gff_out, base_out_dir)
+                                rrna_fasta = os.path.relpath(rrna_fasta_path, base_out_dir) if os.path.exists(rrna_fasta_path) else ""
+                        
+                        genome_records.append({
+                            "Database_Version": db_version,
+                            "Standardized_Name": new_filename,
+                            "Original_Name": f_name,
+                            "Original_Path": input_path,
+                            "Original_Subfolder": os.path.relpath(root, s_dir),
+                            "Source_Folder": source_label,
+                            "Contig_Header_Prefix": contig_prefix,
+                            "Genome_Size_bp": stats.get('Genome_Size_bp', 0),
+                            "Contig_Count": stats.get('Contig_Count', 0),
+                            "GC_Content_%": stats.get('GC_Content_%', 0),
+                            "rRNA_5S_count": rrna_counts.get("5S", 0),
+                            "rRNA_16S_count": rrna_counts.get("16S", 0),
+                            "rRNA_23S_count": rrna_counts.get("23S", 0),
+                            "rRNA_18S_count": rrna_counts.get("18S", 0),
+                            "rRNA_28S_count": rrna_counts.get("28S", 0),
+                            "rRNA_total": rrna_counts.get("total", 0),
+                            "barrnap_gff": rrna_gff,
+                            "barrnap_rrna_fasta": rrna_fasta
+                        })
+            
+            if not genome_records:
+                st.error("No valid fasta files found in the provided directories.")
+                st.stop()
+                
+            st.success(f"Standardized {len(genome_records)} genomes into `{genomes_out_dir}`.")
+            
+            status_container.info(f"Step 2: Running CheckM2 Quality Assessment on {len(genome_records)} genomes...")
+            checkm2_scores = run_checkm2(genomes_out_dir, checkm2_out_dir, threads=threads_db, status_text=status_container)
+            
+            status_container.empty()
+            st.success("🎉 Database build complete!")
+            
+            # 3. Merge CheckM2 stats into records
+            for record in genome_records:
+                g_name = record["Standardized_Name"]
+                c_info = checkm2_scores.get(g_name, {}) if isinstance(checkm2_scores, dict) else {}
+                
+                if isinstance(c_info, dict):
+                    record["Completeness"] = c_info.get('completeness', "N/A")
+                    record["Contamination"] = c_info.get('contamination', "N/A")
+                    record["GTDB_Score"] = c_info.get('score', "N/A")
+                else:
+                    record["Completeness"] = "N/A"
+                    record["Contamination"] = "N/A"
+                    record["GTDB_Score"] = "N/A"
+            
+            # 4. Generate Metadata Report
+            df_metadata = pd.DataFrame(genome_records)
+            metadata_path = os.path.join(base_out_dir, f"{db_name}_{db_version}_metadata.csv")
+            df_metadata.to_csv(metadata_path, index=False)
+            mapping_df = df_metadata[[
+                "Original_Name",
+                "Original_Path",
+                "Original_Subfolder",
+                "Source_Folder",
+                "Standardized_Name",
+                "Contig_Header_Prefix",
+                "rRNA_total",
+                "Database_Version"
+            ]].copy()
+            mapping_path = os.path.join(base_out_dir, f"{db_name}_{db_version}_genome_id_mapping.csv")
+            mapping_df.to_csv(mapping_path, index=False)
+            
+            # 5. UI Presentation
+            st.markdown(f"### 🗄️ Database Summary: {db_name} ({db_version})")
+            
+            col_s1, col_s2, col_s3 = st.columns(3)
+            col_s1.metric("Total Genomes", len(genome_records))
+            col_s2.metric("Unique Sources", df_metadata['Source_Folder'].nunique())
+            avg_comp = pd.to_numeric(df_metadata['Completeness'], errors='coerce').mean()
+            col_s3.metric("Avg Completeness", f"{avg_comp:.2f}%" if pd.notna(avg_comp) else "N/A")
+            
+            db_tab1, db_tab2 = st.tabs(["📋 Metadata", "🔗 Genome ID Mapping"])
+            with db_tab1:
+                st.dataframe(df_metadata)
+            with db_tab2:
+                st.write("Original genome IDs and renamed IDs mapping table:")
+                st.dataframe(mapping_df)
+            
+            st.success(f"✅ Database Genomes saved to: `{os.path.abspath(genomes_out_dir)}`")
+            st.success(f"✅ Database Metadata saved to: `{os.path.abspath(metadata_path)}`")
+            st.success(f"✅ Genome ID mapping saved to: `{os.path.abspath(mapping_path)}`")

@@ -6,9 +6,19 @@ __pycache__/
 # Downloaded data
 gtdb_data/
 ncbi_downloads/
+gtdb_downloads/
+local_databases/
+Symbiont/
 
 # NCBI Datasets CLI tool
 datasets
 
 # OS generated files
 .Trashes
+# pixi environments
+.pixi/*
+!.pixi/config.toml
+local_datasets/
+ncbi_downloads/
+.pixi/
+checkm2_database/
