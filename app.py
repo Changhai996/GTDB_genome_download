@@ -10,6 +10,7 @@ import urllib.request
 import subprocess
 import zipfile
 import smtplib
+import shutil
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.application import MIMEApplication
@@ -54,35 +55,43 @@ def load_data(data_dir="gtdb_data"):
     combined_df = pd.concat(all_data, ignore_index=True)
     return combined_df
 
+_DATASETS_BIN = None
+
+
 def ensure_datasets_cli():
-    if os.path.exists('datasets'):
-        return True
-    system = platform.system().lower()
-    if system == 'darwin':
-        url = 'https://ftp.ncbi.nlm.nih.gov/pub/datasets/command-line/v2/mac/datasets'
-    elif system == 'linux':
-        url = 'https://ftp.ncbi.nlm.nih.gov/pub/datasets/command-line/v2/linux-amd64/datasets'
-    else:
-        return False
-    try:
-        urllib.request.urlretrieve(url, 'datasets')
-        st_mode = os.stat('datasets').st_mode
-        os.chmod('datasets', st_mode | stat.S_IEXEC)
-        return True
-    except Exception as e:
-        st.error(f"Failed to download NCBI datasets CLI: {e}")
-        return False
+    global _DATASETS_BIN
+    if _DATASETS_BIN:
+        return _DATASETS_BIN
+    path = shutil.which("datasets") or shutil.which("ncbi-datasets")
+    if path:
+        _DATASETS_BIN = path
+        return _DATASETS_BIN
+    st.error("未检测到 NCBI 官方 ncbi-datasets-cli（datasets）。请使用 pixi 环境启动网页版：pixi run gtdbkit web")
+    return None
 
 def get_downloaded_accessions(output_dir):
     downloaded = set()
     if not os.path.exists(output_dir):
         return downloaded
     for file in os.listdir(output_dir):
-        if file.endswith('.fna'):
+        if file.endswith((".fna", ".fa", ".fasta", ".fna.gz", ".fa.gz", ".fasta.gz")):
             match = re.match(r'^(GCA_\d+\.\d+|GCF_\d+\.\d+)', file)
             if match:
                 downloaded.add(match.group(1))
     return downloaded
+
+
+def extract_fasta_from_datasets_zip(zip_path: str, output_dir: str) -> int:
+    extracted = 0
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        for member in zf.namelist():
+            if not member.endswith((".fna", ".fa", ".fasta", ".fna.gz", ".fa.gz", ".fasta.gz")):
+                continue
+            target = os.path.join(output_dir, os.path.basename(member))
+            with zf.open(member) as src, open(target, "wb") as dst:
+                shutil.copyfileobj(src, dst)
+            extracted += 1
+    return extracted
 
 def download_genomes(genome_list, output_dir, zip_name="dataset.zip", progress_bar=None, status_text=None, batch_size=20):
     if not genome_list:
@@ -106,6 +115,10 @@ def download_genomes(genome_list, output_dir, zip_name="dataset.zip", progress_b
         if progress_bar:
             progress_bar.progress(1.0)
         return True, f"All {total_genomes} genomes have already been downloaded to `{os.path.abspath(output_dir)}`.", list(downloaded_accs.intersection(set(all_accessions))), []
+
+    datasets_bin = ensure_datasets_cli()
+    if not datasets_bin:
+        return False, "未检测到 NCBI datasets CLI。请使用 pixi 环境运行（pixi run gtdbkit web）。", [], all_accessions
         
     total_pending = len(pending_accessions)
     batches = [pending_accessions[i:i + batch_size] for i in range(0, total_pending, batch_size)]
@@ -124,45 +137,40 @@ def download_genomes(genome_list, output_dir, zip_name="dataset.zip", progress_b
             f.write("\n".join(batch))
             
         current_zip = os.path.join(output_dir, f"dataset_batch_{batch_num}.zip")
-        cmd = ["./datasets", "download", "genome", "accession", "--inputfile", acc_file, "--filename", current_zip, "--include", "genome"]
+        log_path = os.path.join(output_dir, f"dataset_batch_{batch_num}.log")
+        cmd = [
+            datasets_bin,
+            "download",
+            "genome",
+            "accession",
+            "--inputfile",
+            acc_file,
+            "--filename",
+            current_zip,
+            "--include",
+            "genome",
+            "--no-progressbar",
+        ]
         
         try:
-            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-            for line in process.stdout:
-                if status_text and line.strip():
-                    if "Downloading" in line or "Collecting" in line or "Error" in line:
-                        status_text.text(f"Batch {batch_num} Status: {line.strip()}")
-            process.wait()
-            
-            if process.returncode == 0 and os.path.exists(current_zip):
+            proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            with open(log_path, "w", encoding="utf-8") as logf:
+                logf.write(proc.stdout or "")
+
+            if proc.returncode == 0 and os.path.exists(current_zip) and os.path.getsize(current_zip) > 0:
                 if status_text:
                     status_text.info(f"Batch {batch_num} downloaded. Extracting files...")
-                with zipfile.ZipFile(current_zip, 'r') as zip_ref:
-                    zip_ref.extractall(output_dir)
+                batch_fasta_count = extract_fasta_from_datasets_zip(current_zip, output_dir)
                 os.remove(current_zip)
-                
-                data_dir = os.path.join(output_dir, 'ncbi_dataset', 'data')
-                batch_fasta_count = 0
-                if os.path.exists(data_dir):
-                    for root, dirs, files in os.walk(data_dir):
-                        for file in files:
-                            if file.endswith('.fna'):
-                                src = os.path.join(root, file)
-                                dst = os.path.join(output_dir, file)
-                                import shutil
-                                if not os.path.exists(dst):
-                                    shutil.move(src, dst)
-                                    batch_fasta_count += 1
-                    import shutil
-                    shutil.rmtree(os.path.join(output_dir, 'ncbi_dataset'), ignore_errors=True)
-                    if os.path.exists(os.path.join(output_dir, 'README.md')):
-                        os.remove(os.path.join(output_dir, 'README.md'))
-                        
                 successful_downloads += batch_fasta_count
             else:
                 failed_batches += 1
                 if status_text:
-                    status_text.warning(f"Batch {batch_num} failed or returned no data (Return code: {process.returncode}). Moving to next batch...")
+                    tail = (proc.stdout or "").strip().splitlines()[-8:]
+                    msg = "\n".join(tail) if tail else "(no output)"
+                    status_text.warning(
+                        f"Batch {batch_num} failed (Return code: {proc.returncode}). Log: {log_path}\n{msg}"
+                    )
         except Exception as e:
             failed_batches += 1
             if status_text:
