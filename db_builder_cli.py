@@ -258,6 +258,10 @@ def extract_rrna_sequences(
     gff_path: str,
     output_fasta: str,
     rrna_type: str = "16S",
+    genome_name: str = "",
+    source_folder: str = "",
+    original_name: str = "",
+    original_subfolder: str = "",
 ) -> int:
     """Slice rRNA sequences out of `fasta_path` using coordinates from `gff_path`.
 
@@ -309,7 +313,20 @@ def extract_rrna_sequences(
                     attrs_dict[k.strip()] = v.strip()
             product = attrs_dict.get("product", f"{rrna_type} rRNA")
             name = attrs_dict.get("Name", f"{contig}_{start + 1}_{end}_{rrna_type}")
-            out.write(f">{name} {product}\n")
+            header_id, header_desc = format_rrna_header(
+                genome_name=genome_name,
+                rrna_type=rrna_type,
+                feature_name=name,
+                contig=contig,
+                start=start + 1,
+                end=end,
+                strand=strand,
+                product=product,
+                source_folder=source_folder,
+                original_name=original_name,
+                original_subfolder=original_subfolder,
+            )
+            out.write(f">{header_id} {header_desc}\n")
             for i in range(0, len(sub), 80):
                 out.write(sub[i : i + 80] + "\n")
             written += 1
@@ -482,6 +499,103 @@ def fasta_record_count(path: str) -> int:
     return count
 
 
+def _safe_header_value(value: object) -> str:
+    return re.sub(r"\s+", "_", str(value or "").strip()) or "NA"
+
+
+def format_rrna_header(
+    genome_name: str,
+    rrna_type: str,
+    feature_name: str,
+    contig: str,
+    start: int,
+    end: int,
+    strand: str,
+    product: str,
+    source_folder: str = "",
+    original_name: str = "",
+    original_subfolder: str = "",
+) -> Tuple[str, str]:
+    genome_base = os.path.splitext(os.path.basename(genome_name))[0] if genome_name else "GENOME"
+    genome_token = sanitize_token(genome_base, 100, "GENOME")
+    feature_token = sanitize_token(feature_name, 80, rrna_type.upper())
+    contig_token = sanitize_token(contig, 80, "CONTIG")
+    header_id = f"{genome_token}|{rrna_type.upper()}|{feature_token}|{contig_token}|{start}-{end}|{strand}"
+    header_desc = (
+        f"genome={_safe_header_value(genome_name or genome_base)} "
+        f"source={_safe_header_value(source_folder)} "
+        f"original={_safe_header_value(original_name)} "
+        f"subfolder={_safe_header_value(original_subfolder)} "
+        f"contig={_safe_header_value(contig)} "
+        f"range={start}-{end} strand={_safe_header_value(strand)} "
+        f"feature={_safe_header_value(feature_name)} "
+        f"product={_safe_header_value(product)}"
+    )
+    return header_id, header_desc
+
+
+def rrna_fasta_has_genome_metadata(path: str, genome_name: str) -> bool:
+    if not os.path.exists(path):
+        return False
+    genome_base = os.path.splitext(os.path.basename(genome_name))[0] if genome_name else ""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith(">"):
+                    header = line.strip()
+                    return ("genome=" in header) and (genome_base in header or genome_name in header)
+    except OSError:
+        return False
+    return False
+
+
+def rewrite_rrna_fasta_headers(
+    fasta_path: str,
+    record: Dict[str, object],
+    rrna_type: str = "16S",
+) -> int:
+    if not os.path.exists(fasta_path):
+        return 0
+    tmp_path = fasta_path + ".tmp"
+    seq_idx = 0
+    genome_name = str(record.get("Standardized_Name", "") or "")
+    source_folder = str(record.get("Source_Folder", "") or "")
+    original_name = str(record.get("Original_Name", "") or "")
+    original_subfolder = str(record.get("Original_Subfolder", "") or "")
+    try:
+        with open(fasta_path, "r", encoding="utf-8") as src, open(tmp_path, "w", encoding="utf-8") as out:
+            for line in src:
+                if line.startswith(">"):
+                    seq_idx += 1
+                    raw_header = line[1:].strip()
+                    feature_name = raw_header.split()[0] if raw_header else f"{rrna_type}_{seq_idx}"
+                    header_id, header_desc = format_rrna_header(
+                        genome_name=genome_name,
+                        rrna_type=rrna_type,
+                        feature_name=feature_name,
+                        contig=str(record.get("Contig_Header_Prefix", "") or genome_name or "CONTIG"),
+                        start=seq_idx,
+                        end=seq_idx,
+                        strand=".",
+                        product=raw_header or f"{rrna_type} rRNA",
+                        source_folder=source_folder,
+                        original_name=original_name,
+                        original_subfolder=original_subfolder,
+                    )
+                    out.write(f">{header_id} {header_desc}\n")
+                else:
+                    out.write(line)
+        os.replace(tmp_path, fasta_path)
+    except OSError:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+        return 0
+    return seq_idx
+
+
 def append_fasta_file(src_path: str, out_handle) -> int:
     written = 0
     with open(src_path, "r", encoding="utf-8") as src:
@@ -501,12 +615,6 @@ def resolve_record_relpath(record: Dict[str, object], field: str, base_out_dir: 
 
 
 def ensure_record_16s_fasta(record: Dict[str, object], base_out_dir: str) -> Tuple[str, int, str]:
-    existing_16s = resolve_record_relpath(record, "barrnap_16S_fasta", base_out_dir)
-    if existing_16s:
-        count = fasta_record_count(existing_16s)
-        if count > 0:
-            return existing_16s, count, "existing_16s_reused"
-
     genome_name = str(record.get("Standardized_Name", "") or "").strip()
     contig_prefix = str(record.get("Contig_Header_Prefix", "") or os.path.splitext(genome_name)[0]).strip()
     if not genome_name:
@@ -514,11 +622,37 @@ def ensure_record_16s_fasta(record: Dict[str, object], base_out_dir: str) -> Tup
 
     genome_path = os.path.join(base_out_dir, "genomes", genome_name)
     gff_path = resolve_record_relpath(record, "barrnap_gff", base_out_dir)
+    existing_16s = resolve_record_relpath(record, "barrnap_16S_fasta", base_out_dir)
+    if existing_16s:
+        count = fasta_record_count(existing_16s)
+        if count > 0:
+            if rrna_fasta_has_genome_metadata(existing_16s, genome_name):
+                return existing_16s, count, "existing_16s_reused"
+            if gff_path and os.path.exists(genome_path):
+                # Legacy 16S FASTA lacks genome metadata; regenerate from current GFF/genome
+                # so the recovered header retains genome + coordinate information.
+                pass
+            else:
+                rewritten = rewrite_rrna_fasta_headers(existing_16s, record, rrna_type="16S")
+                if rewritten > 0:
+                    record["rRNA_16S_count"] = rewritten
+                    return existing_16s, rewritten, "existing_16s_rewritten"
+                return existing_16s, count, "existing_16s_reused"
+
     if not gff_path or not os.path.exists(genome_path):
         return "", 0, "missing_genome_or_gff"
 
     out_path = os.path.join(base_out_dir, "barrnap_results", f"{contig_prefix}_16S.fasta")
-    count = extract_rrna_sequences(genome_path, gff_path, out_path, rrna_type="16S")
+    count = extract_rrna_sequences(
+        genome_path,
+        gff_path,
+        out_path,
+        rrna_type="16S",
+        genome_name=genome_name,
+        source_folder=str(record.get("Source_Folder", "") or ""),
+        original_name=str(record.get("Original_Name", "") or ""),
+        original_subfolder=str(record.get("Original_Subfolder", "") or ""),
+    )
     if count > 0:
         record["barrnap_16S_fasta"] = os.path.relpath(out_path, base_out_dir)
         record["rRNA_16S_count"] = count
@@ -992,7 +1126,16 @@ def main():
                     n_16s = fasta_record_count(rrna_16s_path)
                     print(f"[{idx}/{total_items}] REUSE 16S FASTA: {rrna_16s_path}")
                 else:
-                    n_16s = extract_rrna_sequences(out_path, gff_out, rrna_16s_path, rrna_type="16S")
+                    n_16s = extract_rrna_sequences(
+                        out_path,
+                        gff_out,
+                        rrna_16s_path,
+                        rrna_type="16S",
+                        genome_name=new_filename,
+                        source_folder=item.source_folder,
+                        original_name=item.filename,
+                        original_subfolder=item.subfolder,
+                    )
                 if n_16s > 0:
                     rrna_16s_rel = os.path.relpath(rrna_16s_path, base_out_dir)
                     rrna_counts["16S"] = n_16s
