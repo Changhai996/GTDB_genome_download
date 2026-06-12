@@ -11,6 +11,7 @@ import subprocess
 import zipfile
 import smtplib
 import shutil
+from typing import List
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.application import MIMEApplication
@@ -54,6 +55,48 @@ def load_data(data_dir="gtdb_data"):
         
     combined_df = pd.concat(all_data, ignore_index=True)
     return combined_df
+
+
+def taxonomy_dropdown_selector(df_in: pd.DataFrame, key_prefix: str, default_domain: str = "d__Archaea") -> str:
+    levels = ["Domain", "Phylum", "Class", "Order", "Family", "Genus", "Species"]
+    df_current = df_in.copy()
+    selection: List[str] = []
+    for idx, level in enumerate(levels):
+        raw_values = df_current[level].dropna().astype(str)
+        values = sorted({v for v in raw_values if v.strip()})
+        options = [""] + values
+        default_value = default_domain if level == "Domain" else ""
+        if default_value not in options:
+            default_value = ""
+        selected = st.selectbox(
+            f"{idx + 1}. {level}",
+            options,
+            index=options.index(default_value),
+            key=f"{key_prefix}_{level}",
+        )
+        if not selected:
+            break
+        selection.append(selected)
+        df_current = df_current[df_current[level] == selected]
+        if df_current.empty:
+            break
+    return selection[-1] if selection else ""
+
+
+def taxonomy_selector(df_in: pd.DataFrame, key_prefix: str, default_text: str) -> str:
+    mode = st.radio(
+        "Taxon 选择方式",
+        options=["下拉选择", "文本搜索"],
+        index=0,
+        horizontal=True,
+        key=f"{key_prefix}_mode",
+    )
+    if mode == "文本搜索":
+        return st.text_input("Taxon（例如 c__Bathyarchaeia）", default_text, key=f"{key_prefix}_text").strip()
+    selected = taxonomy_dropdown_selector(df_in, key_prefix=f"{key_prefix}_dd")
+    if selected:
+        st.caption(f"已选择：{selected}")
+    return selected.strip()
 
 _DATASETS_BIN = None
 
@@ -745,7 +788,7 @@ with tab1:
     df_single = df[df['Version'] == sel_version]
     st.write(f"**Total Genomes in R{sel_version}:** {len(df_single)}")
     
-    search_single = st.text_input("Enter a taxonomic group to search (e.g., c__Bathyarchaeia):", "c__Bathyarchaeia", key="search_single")
+    search_single = taxonomy_selector(df_single, key_prefix="single", default_text="c__Bathyarchaeia")
     if search_single:
         df_res = df_single[df_single['Taxonomy'].str.contains(search_single, na=False)].copy()
         rep_count = df_res['Species'].nunique()
@@ -803,7 +846,7 @@ with tab2:
     if len(selected_versions) < 2:
         st.warning("Please select at least 2 versions to compare.")
     else:
-        search_term = st.text_input("Enter a taxonomic group to analyze:", "c__Bathyarchaeia", key="search_comp")
+        search_term = taxonomy_selector(df, key_prefix="compare", default_text="c__Bathyarchaeia")
         if search_term:
             v1 = selected_versions[-2]
             v2 = selected_versions[-1]
@@ -1005,7 +1048,7 @@ with tab4:
         with col_g1:
             gtdb_comp_version = st.selectbox("GTDB Version", versions, index=len(versions)-1, key="gtdb_comp_v")
         with col_g2:
-            gtdb_comp_taxon = st.text_input("GTDB Taxon to compare against:", "c__Bathyarchaeia", key="gtdb_comp_t")
+            gtdb_comp_taxon = taxonomy_selector(df, key_prefix="pipeline_gtdb_compare", default_text="c__Bathyarchaeia")
             
         st.markdown("##### ⚙️ Compute Settings")
         col_m1, col_m2, col_m3 = st.columns(3)
