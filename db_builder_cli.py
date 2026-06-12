@@ -517,24 +517,33 @@ def format_rrna_header(
     original_name: str = "",
     original_subfolder: str = "",
 ) -> Tuple[str, str]:
-    genome_base = os.path.splitext(os.path.basename(genome_name))[0] if genome_name else "GENOME"
-    genome_token = sanitize_token(genome_base, 100, "GENOME")
+    preferred_name = original_name or genome_name
+    genome_base = os.path.splitext(os.path.basename(preferred_name))[0] if preferred_name else "GENOME"
+    genome_token = re.sub(r"\s+", "_", genome_base).strip() or "GENOME"
     del feature_name, contig, start, end, strand, product, source_folder, original_name, original_subfolder
     header_id = f"{genome_token}_{rrna_type.upper()}_{int(feature_index)}"
     return header_id, ""
 
 
-def rrna_fasta_has_genome_metadata(path: str, genome_name: str) -> bool:
+def rrna_fasta_has_genome_metadata(path: str, genome_name: str, original_name: str = "") -> bool:
     if not os.path.exists(path):
         return False
-    genome_base = os.path.splitext(os.path.basename(genome_name))[0] if genome_name else ""
-    genome_token = sanitize_token(genome_base, 100, "GENOME")
+    candidate_names = [n for n in (original_name, genome_name) if n]
+    candidate_tokens = {
+        re.sub(r"\s+", "_", os.path.splitext(os.path.basename(name))[0]).strip()
+        for name in candidate_names
+        if os.path.splitext(os.path.basename(name))[0].strip()
+    }
     try:
         with open(path, "r", encoding="utf-8") as fh:
             for line in fh:
                 if line.startswith(">"):
                     header = line[1:].strip().split()[0]
-                    return bool(header) and header.startswith(f"{genome_token}_16S_")
+                    return bool(header) and (
+                        any(header.startswith(f"{token}_16S_") for token in candidate_tokens) or
+                        "|16S|" in header or
+                        "genome=" in line
+                    )
     except OSError:
         return False
     return False
@@ -621,7 +630,11 @@ def ensure_record_16s_fasta(record: Dict[str, object], base_out_dir: str) -> Tup
     if existing_16s:
         count = fasta_record_count(existing_16s)
         if count > 0:
-            if rrna_fasta_has_genome_metadata(existing_16s, genome_name):
+            if rrna_fasta_has_genome_metadata(
+                existing_16s,
+                genome_name,
+                original_name=str(record.get("Original_Name", "") or ""),
+            ):
                 return existing_16s, count, "existing_16s_reused"
             if gff_path and os.path.exists(genome_path):
                 # Legacy 16S FASTA lacks genome metadata; regenerate from current GFF/genome
