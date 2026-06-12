@@ -440,6 +440,18 @@ def run_checkm2(
             "message": f"checkm2 finished but {report_file} is missing.",
         }
 
+    scores, parse_error = parse_checkm2_quality_report(report_file)
+    if parse_error:
+        return {
+            "status": "failed",
+            "scores": {},
+            "db_path": db_path,
+            "message": parse_error,
+        }
+    return {"status": "ok", "scores": scores, "db_path": db_path, "message": ""}
+
+
+def parse_checkm2_quality_report(report_file: str) -> Tuple[Dict[str, Dict[str, float]], str]:
     scores: Dict[str, Dict[str, float]] = {}
     try:
         df_q = pd.read_csv(report_file, sep="\t")
@@ -452,13 +464,99 @@ def run_checkm2(
             score = comp - 5 * contam
             scores[name] = {"score": score, "completeness": comp, "contamination": contam}
     except Exception as e:
-        return {
-            "status": "failed",
-            "scores": {},
-            "db_path": db_path,
-            "message": f"Failed to parse quality_report.tsv: {e}",
-        }
-    return {"status": "ok", "scores": scores, "db_path": db_path, "message": ""}
+        return {}, f"Failed to parse quality_report.tsv: {e}"
+    return scores, ""
+
+
+def fasta_record_count(path: str) -> int:
+    if not os.path.exists(path):
+        return 0
+    count = 0
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith(">"):
+                    count += 1
+    except OSError:
+        return 0
+    return count
+
+
+def append_fasta_file(src_path: str, out_handle) -> int:
+    written = 0
+    with open(src_path, "r", encoding="utf-8") as src:
+        for line in src:
+            out_handle.write(line)
+            if line.startswith(">"):
+                written += 1
+    return written
+
+
+def resolve_record_relpath(record: Dict[str, object], field: str, base_out_dir: str) -> str:
+    value = str(record.get(field, "") or "").strip()
+    if not value:
+        return ""
+    path = value if os.path.isabs(value) else os.path.join(base_out_dir, value)
+    return path if os.path.exists(path) else ""
+
+
+def ensure_record_16s_fasta(record: Dict[str, object], base_out_dir: str) -> Tuple[str, int, str]:
+    existing_16s = resolve_record_relpath(record, "barrnap_16S_fasta", base_out_dir)
+    if existing_16s:
+        count = fasta_record_count(existing_16s)
+        if count > 0:
+            return existing_16s, count, "existing_16s_reused"
+
+    genome_name = str(record.get("Standardized_Name", "") or "").strip()
+    contig_prefix = str(record.get("Contig_Header_Prefix", "") or os.path.splitext(genome_name)[0]).strip()
+    if not genome_name:
+        return "", 0, "missing_standardized_name"
+
+    genome_path = os.path.join(base_out_dir, "genomes", genome_name)
+    gff_path = resolve_record_relpath(record, "barrnap_gff", base_out_dir)
+    if not gff_path or not os.path.exists(genome_path):
+        return "", 0, "missing_genome_or_gff"
+
+    out_path = os.path.join(base_out_dir, "barrnap_results", f"{contig_prefix}_16S.fasta")
+    count = extract_rrna_sequences(genome_path, gff_path, out_path, rrna_type="16S")
+    if count > 0:
+        record["barrnap_16S_fasta"] = os.path.relpath(out_path, base_out_dir)
+        record["rRNA_16S_count"] = count
+        return out_path, count, "generated_from_gff"
+    return "", 0, "no_16s_detected"
+
+
+def collect_database_16s_records(
+    records: List[Dict[str, object]],
+    base_out_dir: str,
+    output_fasta: str,
+) -> Dict[str, object]:
+    os.makedirs(os.path.dirname(output_fasta) or ".", exist_ok=True)
+    genomes_with_16s = 0
+    seq_count = 0
+    reused_files = 0
+    generated_files = 0
+    missing_files = 0
+    with open(output_fasta, "w", encoding="utf-8") as out:
+        for record in records:
+            src_path, count, status = ensure_record_16s_fasta(record, base_out_dir)
+            if src_path and count > 0:
+                seq_count += append_fasta_file(src_path, out)
+                genomes_with_16s += 1
+                if status == "generated_from_gff":
+                    generated_files += 1
+                else:
+                    reused_files += 1
+            else:
+                missing_files += 1
+    return {
+        "output_path": output_fasta,
+        "sequence_count": seq_count,
+        "genomes_with_16s": genomes_with_16s,
+        "reused_files": reused_files,
+        "generated_files": generated_files,
+        "missing_files": missing_files,
+    }
 
 
 @dataclass
@@ -663,6 +761,13 @@ def main():
         default=True,
         help="Validate FASTA format from file content during discovery, and also detect FASTA files without standard suffixes. Default: enabled.",
     )
+    parser.add_argument(
+        "-S",
+        "--collect-16s-to",
+        dest="collect_16s_to",
+        default=None,
+        help="Collect all database-wide 16S sequences into one FASTA file. Existing per-genome 16S results are reused when possible.",
+    )
     args = parser.parse_args()
 
     start = _dt.datetime.now()
@@ -671,6 +776,11 @@ def main():
     checkm2_out_dir = os.path.join(base_out_dir, "checkm2_results")
     barrnap_out_dir = os.path.join(base_out_dir, "barrnap_results")
     new_genomes_out_dir = os.path.join(base_out_dir, "_new_genomes_for_qc")
+    metadata_path = os.path.join(base_out_dir, f"{args.db_name}_{args.db_version}_metadata.csv")
+    mapping_path = os.path.join(base_out_dir, f"{args.db_name}_{args.db_version}_genome_id_mapping.csv")
+    scan_path = os.path.join(base_out_dir, f"{args.db_name}_{args.db_version}_scan_inventory.csv")
+    source_inventory_path = os.path.join(base_out_dir, f"{args.db_name}_{args.db_version}_source_counts.csv")
+    version_compare_path = os.path.join(base_out_dir, f"{args.db_name}_{args.db_version}_version_comparison.csv")
     os.makedirs(genomes_out_dir, exist_ok=True)
     if args.run_barrnap:
         os.makedirs(barrnap_out_dir, exist_ok=True)
@@ -679,38 +789,60 @@ def main():
         source_dirs = discover_source_dirs(args.database_root)
     else:
         source_dirs = args.sources or []
-    if not source_dirs:
-        raise SystemExit("Please provide --database-root or --sources.")
+    source_counts: Dict[str, int] = {}
+    total_input_found = 0
+    discovery_stats = {
+        "hidden_skipped": 0,
+        "invalid_fasta_skipped": 0,
+        "non_fasta_ignored": 0,
+        "fasta_detected_by_content": 0,
+    }
+    discovery_skips: List[Dict[str, str]] = []
+    input_genomes: List[InputGenome] = []
+    current_df = pd.DataFrame()
+    current_md5_map: Dict[str, Dict[str, object]] = {}
+    resumed_current_version = 0
 
-    input_genomes, source_counts, total_input_found, discovery_stats, discovery_skips = scan_input_sources(
-        source_dirs,
-        exclude_hidden=args.exclude_hidden,
-        strict_fasta_check=args.strict_fasta_check,
-    )
-    print("== Source FASTA Inventory ==")
-    for source_name, count in source_counts.items():
-        print(f"  {source_name}: {count}")
-    print(f"  Total usable FASTA: {total_input_found}")
-    print("== Discovery Summary ==")
-    print(
-        "  Hidden/invalid FASTA skipped: "
-        f"{discovery_stats['hidden_skipped'] + discovery_stats['invalid_fasta_skipped']}"
-    )
-    print(f"  Hidden files skipped: {discovery_stats['hidden_skipped']}")
-    print(f"  Invalid FASTA skipped: {discovery_stats['invalid_fasta_skipped']}")
-    print(f"  FASTA detected by content: {discovery_stats['fasta_detected_by_content']}")
-    print(f"  Non-FASTA files ignored: {discovery_stats['non_fasta_ignored']}")
-    print(f"  Exclude hidden files: {args.exclude_hidden}")
-    print(f"  Strict FASTA check: {args.strict_fasta_check}")
-
-    if not input_genomes:
-        raise SystemExit("No fasta files found in the provided source folders.")
+    if source_dirs:
+        input_genomes, source_counts, total_input_found, discovery_stats, discovery_skips = scan_input_sources(
+            source_dirs,
+            exclude_hidden=args.exclude_hidden,
+            strict_fasta_check=args.strict_fasta_check,
+        )
+        print("== Source FASTA Inventory ==")
+        for source_name, count in source_counts.items():
+            print(f"  {source_name}: {count}")
+        print(f"  Total usable FASTA: {total_input_found}")
+        print("== Discovery Summary ==")
+        print(
+            "  Hidden/invalid FASTA skipped: "
+            f"{discovery_stats['hidden_skipped'] + discovery_stats['invalid_fasta_skipped']}"
+        )
+        print(f"  Hidden files skipped: {discovery_stats['hidden_skipped']}")
+        print(f"  Invalid FASTA skipped: {discovery_stats['invalid_fasta_skipped']}")
+        print(f"  FASTA detected by content: {discovery_stats['fasta_detected_by_content']}")
+        print(f"  Non-FASTA files ignored: {discovery_stats['non_fasta_ignored']}")
+        print(f"  Exclude hidden files: {args.exclude_hidden}")
+        print(f"  Strict FASTA check: {args.strict_fasta_check}")
+    elif os.path.exists(metadata_path):
+        print("No source directories provided; reusing existing current-version metadata for resume-only operations.")
+    else:
+        raise SystemExit("Please provide --database-root or --sources, or reuse an existing current version with --collect-16s-to.")
 
     prev_base_dir, prev_metadata_path = find_previous_snapshot(args.output_root, args.db_name, args.db_version)
     previous_df = pd.DataFrame()
     previous_md5_map: Dict[str, Dict[str, object]] = {}
     carried_forward = 0
-    if prev_metadata_path and os.path.exists(prev_metadata_path):
+    if os.path.exists(metadata_path):
+        current_df = pd.read_csv(metadata_path)
+        if "File_MD5" in current_df.columns:
+            current_md5_map = {
+                str(row["File_MD5"]): row.to_dict()
+                for _, row in current_df.dropna(subset=["File_MD5"]).iterrows()
+            }
+        resumed_current_version = len(current_df)
+        print(f"Found current version snapshot: {base_out_dir}")
+    elif prev_metadata_path and os.path.exists(prev_metadata_path):
         previous_df = pd.read_csv(prev_metadata_path)
         if "File_MD5" in previous_df.columns:
             previous_md5_map = {
@@ -731,7 +863,16 @@ def main():
     else:
         print("No previous version snapshot found. Building from scratch.")
 
-    records: List[Dict[str, object]] = previous_df.to_dict("records") if not previous_df.empty else []
+    if not source_dirs and current_df.empty:
+        raise SystemExit("No source data or resumable metadata found.")
+    if source_dirs and not input_genomes and current_df.empty:
+        raise SystemExit("No fasta files found in the provided source folders.")
+
+    records: List[Dict[str, object]]
+    if not current_df.empty:
+        records = current_df.to_dict("records")
+    else:
+        records = previous_df.to_dict("records") if not previous_df.empty else []
     for r in records:
         # Mark carried-forward rows so a missing score is never mistaken for a real N/A.
         r.setdefault("Quality_Status", "carried_forward")
@@ -761,6 +902,21 @@ def main():
                 continue
 
         raw_md5 = compute_file_md5(item.path)
+        if raw_md5 in current_md5_map:
+            cur_row = current_md5_map[raw_md5]
+            print(f"[{idx}/{total_items}] RESUME existing current version: {item.path}")
+            scan_records.append(
+                {
+                    "Original_Path": item.path,
+                    "Original_Name": item.filename,
+                    "Source_Folder": item.source_folder,
+                    "Original_Subfolder": item.subfolder,
+                    "File_MD5": raw_md5,
+                    "Status": "Current_Version_Reused",
+                    "Matched_Previous_Name": cur_row.get("Standardized_Name", ""),
+                }
+            )
+            continue
         if raw_md5 in previous_md5_map:
             prev_row = previous_md5_map[raw_md5]
             print(f"[{idx}/{total_items}] SKIP existing: {item.path}")
@@ -820,7 +976,11 @@ def main():
             rrna_gff_path = os.path.join(barrnap_out_dir, f"{contig_prefix}.gff")
             rrna_fasta_path = os.path.join(barrnap_out_dir, f"{contig_prefix}_rrna.fasta")
             rrna_16s_path = os.path.join(barrnap_out_dir, f"{contig_prefix}_16S.fasta")
-            gff_out = run_barrnap(out_path, rrna_gff_path, rrna_fasta_path, args.barrnap_kingdom, args.threads)
+            if os.path.exists(rrna_gff_path) and os.path.exists(rrna_fasta_path):
+                print(f"[{idx}/{total_items}] REUSE barrnap results: {rrna_gff_path}")
+                gff_out = rrna_gff_path
+            else:
+                gff_out = run_barrnap(out_path, rrna_gff_path, rrna_fasta_path, args.barrnap_kingdom, args.threads)
             if gff_out:
                 rrna_counts = parse_barrnap_gff(gff_out)
                 rrna_gff = os.path.relpath(gff_out, base_out_dir)
@@ -828,9 +988,14 @@ def main():
                 # Slice 16S rRNA sequences directly from the genome fasta using the
                 # coordinates barrnap predicted in the GFF. This is independent of
                 # barrnap's own --outseq which only emits the full rRNA mix.
-                n_16s = extract_rrna_sequences(out_path, gff_out, rrna_16s_path, rrna_type="16S")
+                if os.path.exists(rrna_16s_path) and fasta_record_count(rrna_16s_path) > 0:
+                    n_16s = fasta_record_count(rrna_16s_path)
+                    print(f"[{idx}/{total_items}] REUSE 16S FASTA: {rrna_16s_path}")
+                else:
+                    n_16s = extract_rrna_sequences(out_path, gff_out, rrna_16s_path, rrna_type="16S")
                 if n_16s > 0:
                     rrna_16s_rel = os.path.relpath(rrna_16s_path, base_out_dir)
+                    rrna_counts["16S"] = n_16s
 
         record = {
             "Database_Version": args.db_version,
@@ -876,7 +1041,7 @@ def main():
                 "status": "skipped",
                 "scores": {},
                 "db_path": "",
-                "message": "No new genomes to evaluate (incremental build carried everything forward).",
+                "message": "No new genomes to evaluate (incremental build reused prior/current results).",
             }
             print("CheckM2: skipped (no new genomes in this version).")
         else:
@@ -900,8 +1065,25 @@ def main():
                     "--checkm2-db-path, <project>/checkm2_database/CheckM2_database, "
                     "$CHECKM2DB, $DIAMOND_DB."
                 )
-            print(f"Running CheckM2 on {len(new_records)} new genomes...")
-            checkm2_result = run_checkm2(new_genomes_out_dir, checkm2_out_dir, args.threads)
+            existing_report = os.path.join(checkm2_out_dir, "quality_report.tsv")
+            expected_names = {str(r["Standardized_Name"]) for r in new_records}
+            existing_scores: Dict[str, Dict[str, float]] = {}
+            if os.path.exists(existing_report):
+                existing_scores, parse_error = parse_checkm2_quality_report(existing_report)
+                if parse_error:
+                    print(f"Existing CheckM2 report ignored: {parse_error}")
+                    existing_scores = {}
+            if expected_names and expected_names.issubset(existing_scores.keys()):
+                print(f"REUSE existing CheckM2 report: {existing_report}")
+                checkm2_result = {
+                    "status": "resumed",
+                    "scores": {k: existing_scores[k] for k in expected_names},
+                    "db_path": pre_db or "",
+                    "message": "Existing CheckM2 report already covers all genomes staged for this run.",
+                }
+            else:
+                print(f"Running CheckM2 on {len(new_records)} new genomes...")
+                checkm2_result = run_checkm2(new_genomes_out_dir, checkm2_out_dir, args.threads)
             print(f"CheckM2 status: {checkm2_result.get('status')}")
             if checkm2_result.get("message"):
                 print(f"CheckM2 message: {checkm2_result['message']}")
@@ -951,7 +1133,6 @@ def main():
     ]:
         if col not in df_metadata.columns:
             df_metadata[col] = ""
-    metadata_path = os.path.join(base_out_dir, f"{args.db_name}_{args.db_version}_metadata.csv")
     df_metadata.to_csv(metadata_path, index=False)
 
     mapping_df = df_metadata[
@@ -968,17 +1149,14 @@ def main():
             "Database_Version",
         ]
     ].copy()
-    mapping_path = os.path.join(base_out_dir, f"{args.db_name}_{args.db_version}_genome_id_mapping.csv")
     mapping_df.to_csv(mapping_path, index=False)
 
     scan_df = pd.DataFrame(scan_records)
-    scan_path = os.path.join(base_out_dir, f"{args.db_name}_{args.db_version}_scan_inventory.csv")
     scan_df.to_csv(scan_path, index=False)
 
     source_inventory_df = pd.DataFrame(
         [{"Source_Folder": source, "Fasta_Count": count} for source, count in source_counts.items()]
     )
-    source_inventory_path = os.path.join(base_out_dir, f"{args.db_name}_{args.db_version}_source_counts.csv")
     source_inventory_df.to_csv(source_inventory_path, index=False)
 
     version_compare_rows = []
@@ -995,8 +1173,19 @@ def main():
             "Current_Total_Genomes": current_total,
         }
     )
-    version_compare_path = os.path.join(base_out_dir, f"{args.db_name}_{args.db_version}_version_comparison.csv")
     pd.DataFrame(version_compare_rows).to_csv(version_compare_path, index=False)
+
+    collect_16s_result: Optional[Dict[str, object]] = None
+    if args.collect_16s_to:
+        collect_path = os.path.abspath(os.path.expanduser(args.collect_16s_to))
+        collect_16s_result = collect_database_16s_records(records, base_out_dir, collect_path)
+        df_metadata = pd.DataFrame(records)
+        df_metadata.to_csv(metadata_path, index=False)
+        print(
+            "Collected database-wide 16S: "
+            f"{collect_16s_result['sequence_count']} sequences from "
+            f"{collect_16s_result['genomes_with_16s']} genomes -> {collect_path}"
+        )
 
     end = _dt.datetime.now()
     summary_lines = []
@@ -1013,6 +1202,7 @@ def main():
     summary_lines.append(f"Threads: {args.threads}")
     summary_lines.append(f"Run CheckM2: {args.run_checkm2}")
     summary_lines.append(f"Run barrnap: {args.run_barrnap}")
+    summary_lines.append(f"Collect all 16S to: {args.collect_16s_to or ''}")
     summary_lines.append(f"Exclude hidden files: {args.exclude_hidden}")
     summary_lines.append(f"Strict FASTA check: {args.strict_fasta_check}")
     if args.run_barrnap:
@@ -1049,9 +1239,20 @@ def main():
     summary_lines.append("")
     summary_lines.append("--- Incremental Mode ---")
     summary_lines.append(f"Previous snapshot: {prev_base_dir or 'None'}")
+    summary_lines.append(f"Current version rows resumed: {resumed_current_version}")
     summary_lines.append(f"Carried forward genomes: {carried_forward}")
     summary_lines.append(f"New genomes processed: {len(new_records)}")
     summary_lines.append(f"Existing genomes skipped: {int((scan_df['Status'] == 'Existing_Skipped').sum()) if not scan_df.empty else 0}")
+    summary_lines.append(f"Current version reused: {int((scan_df['Status'] == 'Current_Version_Reused').sum()) if not scan_df.empty else 0}")
+    if collect_16s_result is not None:
+        summary_lines.append("")
+        summary_lines.append("--- 16S Collection ---")
+        summary_lines.append(f"Output FASTA: {collect_16s_result['output_path']}")
+        summary_lines.append(f"Sequences written: {collect_16s_result['sequence_count']}")
+        summary_lines.append(f"Genomes with 16S: {collect_16s_result['genomes_with_16s']}")
+        summary_lines.append(f"Existing 16S reused: {collect_16s_result['reused_files']}")
+        summary_lines.append(f"16S regenerated from GFF: {collect_16s_result['generated_files']}")
+        summary_lines.append(f"Genomes without 16S: {collect_16s_result['missing_files']}")
     summary_lines.append("")
     summary_lines.append("--- Output ---")
     summary_lines.append(f"Standardized genomes: {len(records)}")

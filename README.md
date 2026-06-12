@@ -173,7 +173,8 @@ pixi run gtdbkit build-db \
 - `-B / --barrnap`：启用 barrnap
 - `-c / --checkm2-db`：CheckM2 数据库路径
 - `--exclude-hidden / --no-exclude-hidden`：是否跳过 `.DS_Store`、`._*` 等隐藏文件
-- `--strict-fasta-check / --no-strict-fasta-check`：是否按文件内容校验 FASTA 格式，并自动识别无标准后缀的 FASTA
+- `--strict-fasta-check / --no-strict-fasta-check`：开启时按文件内容校验 FASTA，并自动识别无标准后缀的 FASTA；关闭时回退为仅按后缀扫描
+- `-S / --collect-16s-to`：把数据库里所有 16S 汇总到一个输出 FASTA
 
 ### 2. 以多个来源目录方式构建
 
@@ -189,7 +190,7 @@ pixi run gtdbkit build-db \
 
 ### 第三部分会做什么
 
-- 递归扫描 `fa / fna / fasta`，并可自动识别无标准后缀但内容符合 FASTA 格式的文件
+- 递归扫描 `fa / fna / fasta`，默认还会自动识别无标准后缀但内容符合 FASTA 格式的文件
 - 不修改原始文件
 - 标准化文件名
 - 标准化内部序列 header
@@ -199,9 +200,29 @@ pixi run gtdbkit build-db \
 - 运行 CheckM2，输出 `Completeness / Contamination / GTDB_Score`
 - 运行 barrnap，输出 GFF 与 rRNA fasta
 - 额外提取 16S rRNA fasta
+- 可把数据库中全部 16S 再汇总为一个总 FASTA 文件
 - 生成 metadata、log、版本比较表
 - 支持基于 MD5 的增量版本处理
-- 启动时打印隐藏文件、异常 FASTA、无后缀 FASTA 的发现统计
+- 支持按步骤断点续传：若当前版本的标准化基因组、barrnap、16S 或 CheckM2 结果已存在，会优先复用
+- 启动时打印“隐藏/异常 FASTA 共跳过多少个”以及隐藏文件、异常 FASTA、无后缀 FASTA 的发现统计
+
+### 3. 仅汇总当前数据库全部 16S
+
+如果当前版本数据库已经构建完成，只想把全部 16S 提取到一个总文件，可以直接：
+
+```bash
+pixi run gtdbkit build-db \
+  -n Bathyarchaeia \
+  -v v1.0 \
+  -o local_databases \
+  -S /path/to/Bathyarchaeia_all_16S.fasta
+```
+
+说明：
+
+- 这种用法不需要再次提供 `-D` 或 `-s`
+- 程序会直接复用当前版本目录下已有的 `metadata`、标准化基因组和 `barrnap_results`
+- 如果单个基因组缺少 `*_16S.fasta`，但已有对应 GFF，则会先从现有 GFF 补提取，再汇总
 
 ## 第二 + 第三部分一体化
 
