@@ -26,12 +26,22 @@ def load_data(data_dir="gtdb_data"):
         
     files = os.listdir(data_dir)
     tsv_files = [f for f in files if f.endswith(".tsv") or f.endswith(".tsv.gz")]
-    
+
+    selected_by_key = {}
     for f in tsv_files:
-        match = re.search(r"_r(\d+)\.tsv(\.gz)?$", f)
+        match = re.search(r"^(.+?)_taxonomy_r(\d+)\.tsv(\.gz)?$", f)
         if not match:
             continue
-        version = int(match.group(1))
+        dataset = match.group(1)
+        version = int(match.group(2))
+        key = (dataset, version)
+        if key not in selected_by_key:
+            selected_by_key[key] = f
+            continue
+        if f.endswith(".gz") and not selected_by_key[key].endswith(".gz"):
+            selected_by_key[key] = f
+
+    for (dataset, version), f in sorted(selected_by_key.items(), key=lambda x: (x[0][1], x[0][0])):
         filepath = os.path.join(data_dir, f)
         compression = "gzip" if f.endswith(".gz") else None
         df = pd.read_csv(
@@ -41,11 +51,19 @@ def load_data(data_dir="gtdb_data"):
             names=["Genome_ID", "Taxonomy"],
             compression=compression,
         )
+        df["Dataset"] = dataset
         df['Version'] = version
-        tax_levels = df['Taxonomy'].str.split(';', expand=True)
+        df["Taxonomy"] = (
+            df["Taxonomy"]
+            .astype(str)
+            .str.strip()
+            .str.replace(r"\s*;\s*", ";", regex=True)
+            .str.replace(r";+$", "", regex=True)
+        )
+        tax_levels = df["Taxonomy"].str.split(";", expand=True)
         for i, level in enumerate(['Domain', 'Phylum', 'Class', 'Order', 'Family', 'Genus', 'Species']):
             if i < tax_levels.shape[1]:
-                df[level] = tax_levels[i]
+                df[level] = tax_levels[i].astype(str).str.strip().replace({"": None})
             else:
                 df[level] = None
         all_data.append(df)
@@ -54,7 +72,28 @@ def load_data(data_dir="gtdb_data"):
         return pd.DataFrame()
         
     combined_df = pd.concat(all_data, ignore_index=True)
+    combined_df = combined_df.drop_duplicates(subset=["Genome_ID", "Dataset", "Version"], keep="first")
     return combined_df
+
+
+def filter_by_taxon_exact(df_in: pd.DataFrame, taxon: str) -> pd.DataFrame:
+    taxon = str(taxon or "").strip()
+    if not taxon:
+        return df_in.iloc[0:0].copy()
+    prefix_to_level = {
+        "d__": "Domain",
+        "p__": "Phylum",
+        "c__": "Class",
+        "o__": "Order",
+        "f__": "Family",
+        "g__": "Genus",
+        "s__": "Species",
+    }
+    for prefix, level in prefix_to_level.items():
+        if taxon.startswith(prefix) and level in df_in.columns:
+            return df_in[df_in[level].astype(str).str.strip() == taxon].copy()
+    pattern = rf"(?:^|;){re.escape(taxon)}(?:;|$)"
+    return df_in[df_in["Taxonomy"].astype(str).str.contains(pattern, na=False, regex=True)].copy()
 
 
 def taxonomy_dropdown_selector(df_in: pd.DataFrame, key_prefix: str, default_domain: str = "d__Archaea") -> str:
@@ -790,7 +829,7 @@ with tab1:
     
     search_single = taxonomy_selector(df_single, key_prefix="single", default_text="c__Bathyarchaeia")
     if search_single:
-        df_res = df_single[df_single['Taxonomy'].str.contains(search_single, na=False)].copy()
+        df_res = filter_by_taxon_exact(df_single, search_single)
         rep_count = df_res['Species'].nunique()
         st.markdown(f"**Found {len(df_res)} total genomes** and **{rep_count} representative genomes (unique species)** matching `{search_single}`.")
         
@@ -852,8 +891,8 @@ with tab2:
             v2 = selected_versions[-1]
             st.markdown(f"**Comparing R{v1} vs R{v2}**")
             
-            df_v1 = df[(df['Version'] == v1) & (df['Taxonomy'].str.contains(search_term, na=False))]
-            df_v2 = df[(df['Version'] == v2) & (df['Taxonomy'].str.contains(search_term, na=False))]
+            df_v1 = filter_by_taxon_exact(df[df["Version"] == v1], search_term)
+            df_v2 = filter_by_taxon_exact(df[df["Version"] == v2], search_term)
             
             st.markdown("##### 🧬 Total Genomes")
             col1, col2, col3 = st.columns(3)
@@ -1087,7 +1126,7 @@ with tab4:
             
             # --- Sub-step B: Fetch GTDB Representatives ---
             status_container.info(f"Step B: Retrieving GTDB Representatives for {gtdb_comp_taxon} (R{gtdb_comp_version})...")
-            df_gtdb = df[(df['Version'] == gtdb_comp_version) & (df['Taxonomy'].str.contains(gtdb_comp_taxon, na=False))]
+            df_gtdb = filter_by_taxon_exact(df[df["Version"] == gtdb_comp_version], gtdb_comp_taxon)
             if df_gtdb.empty:
                 st.warning(f"No genomes found for {gtdb_comp_taxon} in GTDB R{gtdb_comp_version}. Proceeding with local only.")
             else:
