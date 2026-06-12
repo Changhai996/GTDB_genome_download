@@ -367,9 +367,28 @@ def _route_prepare(argv: list) -> int:
 
 
 def _route_web(argv: list) -> int:
-    app_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app.py")
+    project_dir = os.path.dirname(os.path.abspath(__file__))
+    app_path = os.path.join(project_dir, "app.py")
+    data_dir = os.path.join(project_dir, "gtdb_data")
+
+    def has_taxonomy_data(path: str) -> bool:
+        if not os.path.isdir(path):
+            return False
+        for name in os.listdir(path):
+            if name.endswith(".tsv") or name.endswith(".tsv.gz"):
+                return True
+        return False
+
+    if not has_taxonomy_data(data_dir):
+        dl_script = os.path.join(project_dir, "download_gtdb_taxonomy.py")
+        if os.path.exists(dl_script):
+            print("web: gtdb_data not found; downloading GTDB taxonomy tables first...", flush=True)
+            subprocess.run([sys.executable, dl_script], cwd=project_dir)
+        else:
+            print("web: gtdb_data not found and download_gtdb_taxonomy.py missing; please download taxonomy first.", flush=True)
+
     cmd = [sys.executable, "-m", "streamlit", "run", app_path] + list(argv)
-    completed = subprocess.run(cmd)
+    completed = subprocess.run(cmd, cwd=project_dir)
     return completed.returncode
 
 

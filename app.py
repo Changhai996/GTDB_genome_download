@@ -23,15 +23,22 @@ def load_data(data_dir="gtdb_data"):
         return pd.DataFrame()
         
     files = os.listdir(data_dir)
-    tsv_files = [f for f in files if f.endswith('.tsv')]
+    tsv_files = [f for f in files if f.endswith(".tsv") or f.endswith(".tsv.gz")]
     
     for f in tsv_files:
-        match = re.search(r'_r(\d+)\.tsv', f)
+        match = re.search(r"_r(\d+)\.tsv(\.gz)?$", f)
         if not match:
             continue
         version = int(match.group(1))
         filepath = os.path.join(data_dir, f)
-        df = pd.read_csv(filepath, sep='\t', header=None, names=['Genome_ID', 'Taxonomy'])
+        compression = "gzip" if f.endswith(".gz") else None
+        df = pd.read_csv(
+            filepath,
+            sep="\t",
+            header=None,
+            names=["Genome_ID", "Taxonomy"],
+            compression=compression,
+        )
         df['Version'] = version
         tax_levels = df['Taxonomy'].str.split(';', expand=True)
         for i, level in enumerate(['Domain', 'Phylum', 'Class', 'Order', 'Family', 'Genus', 'Species']):
@@ -711,9 +718,11 @@ def run_fastani_comparison(my_genomes_dir, gtdb_genomes_dir, fastani_path, mash_
 
 st.title("GTDB & NCBI Genomes Toolkit")
 
-df = load_data()
+data_dir = st.sidebar.text_input("GTDB taxonomy 数据目录", value="gtdb_data")
+df = load_data(data_dir=data_dir)
 if df.empty:
-    st.error("No data found in 'gtdb_data' directory. Please run the download script first.")
+    st.error(f"No data found in '{data_dir}' directory. Please run the download script first.")
+    st.code("pixi run python download_gtdb_taxonomy.py", language="bash")
     st.stop()
 
 versions = sorted(df['Version'].unique())
