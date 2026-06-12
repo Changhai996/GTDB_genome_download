@@ -75,6 +75,8 @@ pixi run gtdbkit web
 pixi run web
 ```
 
+说明：网页版下载基因组使用 NCBI 官方 `ncbi-datasets-cli`（命令名 `datasets`），所以务必通过 `pixi run ...` 启动，确保 `datasets` 在环境里可用。
+
 网页版主文件：
 
 - `app.py`
