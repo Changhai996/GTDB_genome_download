@@ -199,7 +199,7 @@ pixi run gtdbkit build-db \
 - 统计 `Genome_Size_bp / Contig_Count / GC_Content_%`
 - 运行 CheckM2，输出 `Completeness / Contamination / GTDB_Score`
 - 运行 barrnap，输出 GFF 与 rRNA fasta
-- 额外提取 16S rRNA fasta，header 仅保留简短的基因组名与序号
+- 额外提取 16S rRNA fasta，header 保留修改后的基因组名，并在需要时追加序号
 - 可把数据库中全部 16S 再汇总为一个总 FASTA 文件
 - 生成 metadata、log、版本比较表
 - 支持基于 MD5 的增量版本处理

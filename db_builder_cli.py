@@ -25,13 +25,41 @@ def sanitize_token(text: str, max_len: int, fallback_prefix: str) -> str:
     return cleaned
 
 
+def sanitize_alnum_token(text: str, max_len: int, fallback_prefix: str) -> str:
+    raw = text if text is not None else ""
+    ascii_text = unicodedata.normalize("NFKD", str(raw)).encode("ascii", "ignore").decode("ascii")
+    cleaned = re.sub(r"[^A-Za-z0-9]+", "", ascii_text)
+    digest = hashlib.md5(str(raw).encode("utf-8", errors="ignore")).hexdigest()[:8].upper()
+    fallback_ascii = unicodedata.normalize("NFKD", str(fallback_prefix or "GENOME")).encode("ascii", "ignore").decode("ascii")
+    fallback = re.sub(r"[^A-Za-z0-9]+", "", fallback_ascii) or "GENOME"
+    if not cleaned:
+        cleaned = f"{fallback}{digest}"
+    if len(cleaned) > max_len:
+        cleaned = cleaned[:max_len]
+    return cleaned
+
+
+def make_source_code(source_folder: str, max_len: int = 10) -> str:
+    return sanitize_alnum_token(source_folder, max_len=max_len, fallback_prefix="SRC")
+
+
+def make_database_code(db_name: str, max_len: int = 12) -> str:
+    return sanitize_alnum_token(db_name, max_len=max_len, fallback_prefix="DB")
+
+
+def build_renamed_genome_id(db_name: str, source_folder: str, serial: int) -> str:
+    db_code = make_database_code(db_name, max_len=12)
+    source_code = make_source_code(source_folder, max_len=10)
+    return f"{db_code}{source_code}{int(serial):05d}"
+
+
 def ensure_unique_filename(output_dir: str, base_name: str, ext: str, max_len: int = 120) -> str:
     candidate = f"{base_name}{ext}"
     if not os.path.exists(os.path.join(output_dir, candidate)):
         return candidate
     idx = 2
     while True:
-        suffix = f"_{idx}"
+        suffix = f"{idx:02d}"
         trimmed = base_name
         if len(trimmed) + len(suffix) > max_len:
             trimmed = trimmed[: max_len - len(suffix)]
@@ -186,7 +214,7 @@ def standardize_fasta_stream(input_path: str, output_path: str, contig_prefix: s
     with open(input_path, "r", encoding="utf-8") as fin, open(output_path, "w", encoding="utf-8") as fout:
         for line in fin:
             if line.startswith(">"):
-                fout.write(f">{contig_prefix}_contig_{contig_idx}\n")
+                fout.write(f">{contig_prefix}Contig{contig_idx:04d}\n")
                 contig_idx += 1
                 contig_count += 1
                 continue
@@ -517,20 +545,20 @@ def format_rrna_header(
     original_name: str = "",
     original_subfolder: str = "",
 ) -> Tuple[str, str]:
-    preferred_name = original_name or genome_name
-    genome_base = os.path.splitext(os.path.basename(preferred_name))[0] if preferred_name else "GENOME"
-    genome_token = re.sub(r"\s+", "_", genome_base).strip() or "GENOME"
+    genome_base = os.path.splitext(os.path.basename(genome_name))[0] if genome_name else "GENOME"
+    genome_token = sanitize_alnum_token(genome_base, max_len=40, fallback_prefix="GENOME")
     del feature_name, contig, start, end, strand, product, source_folder, original_name, original_subfolder
-    header_id = f"{genome_token}_{rrna_type.upper()}_{int(feature_index)}"
+    header_id = f"{genome_token}{rrna_type.upper()}{int(feature_index):04d}"
     return header_id, ""
 
 
 def rrna_fasta_has_genome_metadata(path: str, genome_name: str, original_name: str = "") -> bool:
     if not os.path.exists(path):
         return False
-    candidate_names = [n for n in (original_name, genome_name) if n]
+    del original_name
+    candidate_names = [n for n in (genome_name,) if n]
     candidate_tokens = {
-        re.sub(r"\s+", "_", os.path.splitext(os.path.basename(name))[0]).strip()
+        sanitize_alnum_token(os.path.splitext(os.path.basename(name))[0], max_len=40, fallback_prefix="GENOME")
         for name in candidate_names
         if os.path.splitext(os.path.basename(name))[0].strip()
     }
@@ -540,7 +568,7 @@ def rrna_fasta_has_genome_metadata(path: str, genome_name: str, original_name: s
                 if line.startswith(">"):
                     header = line[1:].strip().split()[0]
                     return bool(header) and (
-                        any(header.startswith(f"{token}_16S_") for token in candidate_tokens) or
+                        any(header.startswith(f"{token}16S") for token in candidate_tokens) or
                         "|16S|" in header or
                         "genome=" in line
                     )
@@ -650,7 +678,7 @@ def ensure_record_16s_fasta(record: Dict[str, object], base_out_dir: str) -> Tup
     if not gff_path or not os.path.exists(genome_path):
         return "", 0, "missing_genome_or_gff"
 
-    out_path = os.path.join(base_out_dir, "barrnap_results", f"{contig_prefix}_16S.fasta")
+    out_path = os.path.join(base_out_dir, "barrnap_results", f"{contig_prefix}16S.fasta")
     count = extract_rrna_sequences(
         genome_path,
         gff_path,
@@ -1022,6 +1050,7 @@ def main():
     scan_records: List[Dict[str, object]] = list(discovery_skips)
     new_records: List[Dict[str, object]] = []
     os.makedirs(new_genomes_out_dir, exist_ok=True)
+    next_genome_serial = len(records) + 1
 
     total_items = len(input_genomes)
     for idx, item in enumerate(input_genomes, start=1):
@@ -1076,12 +1105,10 @@ def main():
             continue
 
         print(f"[{idx}/{total_items}] NEW processing: {item.path}")
-        safe_source = sanitize_token(item.source_folder, 32, "SOURCE")
-        original_name = os.path.splitext(item.filename)[0]
-        safe_orig = sanitize_token(original_name, 80, "GENOME")
-        prefix_base = f"{safe_source}_{safe_orig}"
-        prefix = sanitize_token(prefix_base, 100, "GENOME")
-        new_filename = ensure_unique_filename(genomes_out_dir, prefix, ".fna")
+        source_code = make_source_code(item.source_folder, max_len=10)
+        renamed_genome_id = build_renamed_genome_id(args.db_name, item.source_folder, next_genome_serial)
+        next_genome_serial += 1
+        new_filename = ensure_unique_filename(genomes_out_dir, renamed_genome_id, ".fna")
         out_path = os.path.join(genomes_out_dir, new_filename)
         contig_prefix = os.path.splitext(new_filename)[0]
         qc_stage_path = os.path.join(new_genomes_out_dir, new_filename)
@@ -1115,9 +1142,9 @@ def main():
         rrna_fasta_rel = ""
         rrna_16s_rel = ""
         if args.run_barrnap:
-            rrna_gff_path = os.path.join(barrnap_out_dir, f"{contig_prefix}.gff")
-            rrna_fasta_path = os.path.join(barrnap_out_dir, f"{contig_prefix}_rrna.fasta")
-            rrna_16s_path = os.path.join(barrnap_out_dir, f"{contig_prefix}_16S.fasta")
+            rrna_gff_path = os.path.join(barrnap_out_dir, f"{contig_prefix}Barrnap.gff")
+            rrna_fasta_path = os.path.join(barrnap_out_dir, f"{contig_prefix}Rrna.fasta")
+            rrna_16s_path = os.path.join(barrnap_out_dir, f"{contig_prefix}16S.fasta")
             if os.path.exists(rrna_gff_path) and os.path.exists(rrna_fasta_path):
                 print(f"[{idx}/{total_items}] REUSE barrnap results: {rrna_gff_path}")
                 gff_out = rrna_gff_path
@@ -1139,7 +1166,7 @@ def main():
                         gff_out,
                         rrna_16s_path,
                         rrna_type="16S",
-                        genome_name=new_filename,
+                        genome_name=contig_prefix,
                         source_folder=item.source_folder,
                         original_name=item.filename,
                         original_subfolder=item.subfolder,
@@ -1150,11 +1177,15 @@ def main():
 
         record = {
             "Database_Version": args.db_version,
+            "Renamed_Genome_ID": contig_prefix,
             "Standardized_Name": new_filename,
             "Original_Name": item.filename,
             "Original_Path": item.path,
             "Original_Subfolder": item.subfolder,
             "Source_Folder": item.source_folder,
+            "Source_Code": source_code,
+            "Genome_Serial": next_genome_serial - 1,
+            "Sequence_Header_Prefix": contig_prefix,
             "Contig_Header_Prefix": contig_prefix,
             "File_MD5": raw_md5,
             "Genome_Size_bp": size_bp,
@@ -1181,6 +1212,7 @@ def main():
                 "File_MD5": raw_md5,
                 "Status": "New_Processed",
                 "Matched_Previous_Name": "",
+                "Renamed_Genome_ID": contig_prefix,
                 "Standardized_Name": new_filename,
             }
         )
@@ -1268,6 +1300,10 @@ def main():
     records.extend(new_records)
     df_metadata = pd.DataFrame(records)
     for col in [
+        "Renamed_Genome_ID",
+        "Source_Code",
+        "Genome_Serial",
+        "Sequence_Header_Prefix",
         "Original_Name",
         "Original_Path",
         "Original_Subfolder",
@@ -1288,12 +1324,16 @@ def main():
 
     mapping_df = df_metadata[
         [
+            "Renamed_Genome_ID",
+            "Standardized_Name",
+            "Source_Code",
+            "Genome_Serial",
+            "Sequence_Header_Prefix",
+            "Contig_Header_Prefix",
             "Original_Name",
             "Original_Path",
             "Original_Subfolder",
             "Source_Folder",
-            "Standardized_Name",
-            "Contig_Header_Prefix",
             "File_MD5",
             "rRNA_total",
             "Version_Status",
