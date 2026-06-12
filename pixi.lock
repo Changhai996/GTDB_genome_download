@@ -13,6 +13,7 @@ environments:
       - conda: https://conda.anaconda.org/bioconda/linux-64/diamond-2.1.11-h5ca1c30_2.tar.bz2
       - conda: https://conda.anaconda.org/bioconda/linux-64/hmmer-3.4-hb6cb901_4.tar.bz2
       - conda: https://conda.anaconda.org/bioconda/linux-64/prodigal-2.6.3-h577a1d6_11.tar.bz2
+      - conda: https://conda.anaconda.org/bioconda/linux-64/skani-0.3.2-h79ce301_0.conda
       - conda: https://conda.anaconda.org/bioconda/noarch/barrnap-0.9-hdfd78af_4.tar.bz2
       - conda: https://conda.anaconda.org/bioconda/noarch/checkm2-1.1.0-pyh7e72e81_1.tar.bz2
       - conda: https://conda.anaconda.org/conda-forge/linux-64/_openmp_mutex-4.5-20_gnu.conda
@@ -233,6 +234,7 @@ environments:
       - conda: https://conda.anaconda.org/bioconda/osx-arm64/diamond-2.1.11-h697fd72_2.tar.bz2
       - conda: https://conda.anaconda.org/bioconda/osx-arm64/hmmer-3.4-ha1750f9_4.tar.bz2
       - conda: https://conda.anaconda.org/bioconda/osx-arm64/prodigal-2.6.3-hba9b596_11.tar.bz2
+      - conda: https://conda.anaconda.org/bioconda/osx-arm64/skani-0.3.2-h8f6e10a_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/absl-py-2.4.0-pyhd8ed1ab_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/altair-6.2.1-pyhd8ed1ab_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/anyio-4.13.0-pyhcf101f3_0.conda
@@ -480,6 +482,17 @@ packages:
   license_family: GPL3
   size: 601984
   timestamp: 1752712731224
+- conda: https://conda.anaconda.org/bioconda/linux-64/skani-0.3.2-h79ce301_0.conda
+  sha256: 5b030c2b009efb39dee6f22eef930538805dbbf4442aab7ffd475d0a1e24d642
+  md5: e6df8f4baeed8d5f4a301be77b5af25c
+  depends:
+  - libgcc >=14
+  - libstdcxx >=14
+  constrains:
+  - __glibc >=2.17
+  license: MIT
+  size: 744595
+  timestamp: 1778698853173
 - conda: https://conda.anaconda.org/bioconda/noarch/barrnap-0.9-hdfd78af_4.tar.bz2
   sha256: 28ee23b1ab54e33744b286aab2c93ca9084eeda03da6f6251ddfa2f2c3aa1ff0
   md5: da96203ff6df1a221c22dfde37951bdf
@@ -551,6 +564,16 @@ packages:
   license_family: GPL3
   size: 455607
   timestamp: 1752712470905
+- conda: https://conda.anaconda.org/bioconda/osx-arm64/skani-0.3.2-h8f6e10a_0.conda
+  sha256: 79c006767b1d108c724cfc3f37424099a3b30f828432f95876d4c5cc69fa04ba
+  md5: cc429c190d3325e9df3eb2d7658ab68d
+  depends:
+  - libcxx >=19
+  constrains:
+  - __osx >=11.0
+  license: MIT
+  size: 637034
+  timestamp: 1778698536534
 - conda: https://conda.anaconda.org/conda-forge/linux-64/_openmp_mutex-4.5-20_gnu.conda
   build_number: 20
   sha256: 1dd3fffd892081df9726d7eb7e0dea6198962ba775bd88842135a4ddb4deb3c9

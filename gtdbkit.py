@@ -89,6 +89,9 @@ def _add_build_parser(sub: argparse._SubParsersAction) -> None:
         default=None,
         help="把数据库里所有 16S 序列汇总到一个 FASTA 文件。",
     )
+    p.add_argument("--ani-cluster", action=argparse.BooleanOptionalAction, default=False, help="启用 skani 的 ANI 重复度聚类分析。默认关闭。")
+    p.add_argument("--ani-threshold", type=float, default=95.0, help="ANI 聚类阈值，默认 95.0。")
+    p.add_argument("--af-threshold", type=float, default=60.0, help="AF 聚类阈值，默认 60.0。")
 
 
 def _add_download_parser(sub: argparse._SubParsersAction) -> None:
@@ -188,6 +191,9 @@ def _add_prepare_parser(sub: argparse._SubParsersAction) -> None:
         default=None,
         help="把数据库里所有 16S 序列汇总到一个 FASTA 文件。",
     )
+    p.add_argument("--ani-cluster", action=argparse.BooleanOptionalAction, default=False, help="启用 skani 的 ANI 重复度聚类分析。默认关闭。")
+    p.add_argument("--ani-threshold", type=float, default=95.0, help="ANI 聚类阈值，默认 95.0。")
+    p.add_argument("--af-threshold", type=float, default=60.0, help="AF 聚类阈值，默认 60.0。")
     p.add_argument(
         "-s",
         "--source-dir",
@@ -276,6 +282,9 @@ def _route_prepare(argv: list) -> int:
     parser.add_argument("--exclude-hidden", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--strict-fasta-check", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("-S", "--collect-16s-to", dest="collect_16s_to", default=None)
+    parser.add_argument("--ani-cluster", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--ani-threshold", type=float, default=95.0)
+    parser.add_argument("--af-threshold", type=float, default=60.0)
     parser.add_argument("-s", "--source-dir", "--extra-sources", dest="extra_sources", nargs="+", default=[])
     parser.add_argument("-d", "--download-dir", "--download-root", dest="download_root", default="gtdb_downloads")
     parser.add_argument("-o", "--out-dir", "--output-root", dest="output_root", default="local_databases")
@@ -345,6 +354,12 @@ def _route_prepare(argv: list) -> int:
         build_argv += ["--no-strict-fasta-check"]
     if args.collect_16s_to:
         build_argv += ["--collect-16s-to", args.collect_16s_to]
+    if args.ani_cluster:
+        build_argv += ["--ani-cluster"]
+    if args.ani_threshold != 95.0:
+        build_argv += ["--ani-threshold", str(args.ani_threshold)]
+    if args.af_threshold != 60.0:
+        build_argv += ["--af-threshold", str(args.af_threshold)]
 
     print("\n== Phase 2: build versioned database ==", flush=True)
     rc = _route_build(build_argv)

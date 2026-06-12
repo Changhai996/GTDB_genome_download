@@ -192,15 +192,17 @@ pixi run gtdbkit build-db \
 
 - 递归扫描 `fa / fna / fasta`，默认还会自动识别无标准后缀但内容符合 FASTA 格式的文件
 - 不修改原始文件
-- 标准化文件名
-- 标准化内部序列 header
-- contig header 与最终 genome 名统一
+- 基因组统一重命名为简洁风格，例如 `Bathy0001FIM`
+- contig header 统一为 `GenomeName_0001`
+- 16S header 单条时直接沿用 genome 名，多条时追加编号，例如 `Bathy0001FIM_2`
 - 输出重命名前后映射表
 - 统计 `Genome_Size_bp / Contig_Count / GC_Content_%`
 - 运行 CheckM2，输出 `Completeness / Contamination / GTDB_Score`
 - 运行 barrnap，输出 GFF 与 rRNA fasta
 - 额外提取 16S rRNA fasta，header 保留修改后的基因组名，并在需要时追加序号
 - 可把数据库中全部 16S 再汇总为一个总 FASTA 文件
+- 终端默认使用紧凑进度展示，并在结束后汇总输出基因组大小、contig 数、GC%、16S 情况和完整度/污染度分布
+- 可选启用 `--ani-cluster`，输出 `100%` 精确重复和 `95% ANI / AF 60%` 聚类结果
 - 生成 metadata、log、版本比较表
 - 支持基于 MD5 的增量版本处理
 - 支持按步骤断点续传：若当前版本的标准化基因组、barrnap、16S 或 CheckM2 结果已存在，会优先复用

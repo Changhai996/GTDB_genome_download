@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
+from tqdm import tqdm
 
 
 def sanitize_token(text: str, max_len: int, fallback_prefix: str) -> str:
@@ -39,18 +40,33 @@ def sanitize_alnum_token(text: str, max_len: int, fallback_prefix: str) -> str:
     return cleaned
 
 
-def make_source_code(source_folder: str, max_len: int = 10) -> str:
-    return sanitize_alnum_token(source_folder, max_len=max_len, fallback_prefix="SRC")
+def make_db_prefix(db_name: str, max_len: int = 5) -> str:
+    token = sanitize_alnum_token(db_name, max_len=max_len, fallback_prefix="BATHY")
+    if not token:
+        return "Bathy"
+    token = token[:max_len]
+    return token[:1].upper() + token[1:].lower()
 
 
-def make_database_code(db_name: str, max_len: int = 12) -> str:
-    return sanitize_alnum_token(db_name, max_len=max_len, fallback_prefix="DB")
+def make_source_letters(source_folder: str, max_len: int = 3) -> str:
+    parts = re.findall(r"[A-Za-z]+", str(source_folder or ""))
+    initials = "".join(p[0].upper() for p in parts if p)
+    if not initials:
+        initials = sanitize_alnum_token(source_folder, max_len=max_len, fallback_prefix="SRC").upper()
+    if len(initials) < max_len:
+        extra = "".join(parts).upper()
+        for ch in extra:
+            if len(initials) >= max_len:
+                break
+            if ch not in initials:
+                initials += ch
+    return initials[:max_len] or "SRC"
 
 
 def build_renamed_genome_id(db_name: str, source_folder: str, serial: int) -> str:
-    db_code = make_database_code(db_name, max_len=12)
-    source_code = make_source_code(source_folder, max_len=10)
-    return f"{db_code}{source_code}{int(serial):05d}"
+    db_prefix = make_db_prefix(db_name, max_len=5)
+    source_letters = make_source_letters(source_folder, max_len=3)
+    return f"{db_prefix}{int(serial):04d}{source_letters}"
 
 
 def ensure_unique_filename(output_dir: str, base_name: str, ext: str, max_len: int = 120) -> str:
@@ -206,6 +222,298 @@ def compute_file_md5(path: str, chunk_size: int = 1024 * 1024) -> str:
     return digest.hexdigest()
 
 
+def compute_fasta_sequence_signature(path: str) -> str:
+    digest = hashlib.md5()
+    with open(path, "r", encoding="utf-8") as f:
+        for raw in f:
+            if raw.startswith(">"):
+                digest.update(b"\x1e")
+                continue
+            seq = raw.strip().upper()
+            if seq:
+                digest.update(seq.encode("ascii", errors="ignore"))
+    return digest.hexdigest()
+
+
+def _numeric_series(df: pd.DataFrame, column: str) -> pd.Series:
+    if column not in df.columns:
+        return pd.Series(dtype=float)
+    return pd.to_numeric(df[column], errors="coerce").dropna()
+
+
+def _format_numeric_summary(label: str, values: pd.Series, precision: int = 2) -> List[str]:
+    if values.empty:
+        return [f"{label}: no data"]
+    fmt = f"{{:.{precision}f}}"
+    return [
+        (
+            f"{label}: n={len(values)}, min={fmt.format(values.min())}, "
+            f"median={fmt.format(values.median())}, mean={fmt.format(values.mean())}, "
+            f"max={fmt.format(values.max())}"
+        )
+    ]
+
+
+def summarize_metadata_metrics(df: pd.DataFrame) -> Dict[str, List[str]]:
+    sections: Dict[str, List[str]] = {"size": [], "quality": [], "rrna16s": []}
+    sections["size"].extend(_format_numeric_summary("Genome_Size_bp", _numeric_series(df, "Genome_Size_bp"), precision=0))
+    sections["size"].extend(_format_numeric_summary("Contig_Count", _numeric_series(df, "Contig_Count"), precision=0))
+    sections["size"].extend(_format_numeric_summary("GC_Content_%", _numeric_series(df, "GC_Content_%"), precision=2))
+
+    completeness = _numeric_series(df, "Completeness")
+    contamination = _numeric_series(df, "Contamination")
+    sections["quality"].extend(_format_numeric_summary("Completeness", completeness, precision=2))
+    if not completeness.empty:
+        sections["quality"].append(
+            "Completeness bins: "
+            f">=90={int((completeness >= 90).sum())}, "
+            f"70-90={int(((completeness >= 70) & (completeness < 90)).sum())}, "
+            f"50-70={int(((completeness >= 50) & (completeness < 70)).sum())}, "
+            f"<50={int((completeness < 50).sum())}"
+        )
+    sections["quality"].extend(_format_numeric_summary("Contamination", contamination, precision=2))
+    if not contamination.empty:
+        sections["quality"].append(
+            "Contamination bins: "
+            f"<5={int((contamination < 5).sum())}, "
+            f"5-10={int(((contamination >= 5) & (contamination <= 10)).sum())}, "
+            f">10={int((contamination > 10).sum())}"
+        )
+
+    rrna_16s = _numeric_series(df, "rRNA_16S_count")
+    if rrna_16s.empty:
+        sections["rrna16s"].append("16S status: no data")
+    else:
+        sections["rrna16s"].append(
+            "16S status: "
+            f"genomes_with_16S={int((rrna_16s > 0).sum())}, "
+            f"single_16S={int((rrna_16s == 1).sum())}, "
+            f"multi_16S={int((rrna_16s > 1).sum())}, "
+            f"without_16S={int((rrna_16s <= 0).sum())}, "
+            f"max_copy={int(rrna_16s.max())}"
+        )
+    return sections
+
+
+class _UnionFind:
+    def __init__(self) -> None:
+        self.parent: Dict[str, str] = {}
+
+    def add(self, item: str) -> None:
+        if item not in self.parent:
+            self.parent[item] = item
+
+    def find(self, item: str) -> str:
+        parent = self.parent.setdefault(item, item)
+        if parent != item:
+            self.parent[item] = self.find(parent)
+        return self.parent[item]
+
+    def union(self, a: str, b: str) -> None:
+        ra = self.find(a)
+        rb = self.find(b)
+        if ra != rb:
+            self.parent[rb] = ra
+
+
+def build_exact_duplicate_report(df_metadata: pd.DataFrame, base_out_dir: str, output_csv: str) -> Dict[str, object]:
+    signature_to_members: Dict[str, List[str]] = {}
+    exact_md5: List[str] = []
+    for _, row in df_metadata.iterrows():
+        standardized_name = str(row.get("Standardized_Name", "") or "").strip()
+        if not standardized_name:
+            exact_md5.append("")
+            continue
+        genome_path = os.path.join(base_out_dir, "genomes", standardized_name)
+        if not os.path.exists(genome_path):
+            exact_md5.append("")
+            continue
+        sig = compute_fasta_sequence_signature(genome_path)
+        exact_md5.append(sig)
+        signature_to_members.setdefault(sig, []).append(standardized_name)
+    df_metadata["Exact_Sequence_MD5"] = exact_md5
+    df_metadata["Exact_Duplicate_Group"] = ""
+
+    rows: List[Dict[str, object]] = []
+    duplicate_group_count = 0
+    duplicate_genome_count = 0
+    for group_idx, (sig, members) in enumerate(sorted(signature_to_members.items()), start=1):
+        if len(members) <= 1:
+            continue
+        duplicate_group_count += 1
+        duplicate_genome_count += len(members)
+        group_id = f"ExactDup{group_idx:04d}"
+        for standardized_name in members:
+            df_metadata.loc[df_metadata["Standardized_Name"] == standardized_name, "Exact_Duplicate_Group"] = group_id
+            row = df_metadata.loc[df_metadata["Standardized_Name"] == standardized_name].iloc[0]
+            rows.append(
+                {
+                    "Exact_Duplicate_Group": group_id,
+                    "Exact_Sequence_MD5": sig,
+                    "Renamed_Genome_ID": row.get("Renamed_Genome_ID", ""),
+                    "Standardized_Name": standardized_name,
+                    "Original_Name": row.get("Original_Name", ""),
+                    "Original_Path": row.get("Original_Path", ""),
+                    "Genome_Size_bp": row.get("Genome_Size_bp", ""),
+                    "Contig_Count": row.get("Contig_Count", ""),
+                    "GC_Content_%": row.get("GC_Content_%", ""),
+                }
+            )
+    pd.DataFrame(rows).to_csv(output_csv, index=False)
+    return {
+        "output_csv": output_csv,
+        "duplicate_group_count": duplicate_group_count,
+        "duplicate_genome_count": duplicate_genome_count,
+        "unique_signature_count": len(signature_to_members),
+    }
+
+
+def _parse_skani_sparse_value_file(path: str) -> Dict[Tuple[str, str], float]:
+    values: Dict[Tuple[str, str], float] = {}
+    if not os.path.exists(path):
+        return values
+    with open(path, "r", encoding="utf-8") as f:
+        for raw in f:
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = re.split(r"\s+", line)
+            if len(parts) < 3:
+                continue
+            a, b = parts[0], parts[1]
+            try:
+                val = float(parts[-1])
+            except ValueError:
+                continue
+            values[(a, b)] = val
+    return values
+
+
+def run_skani_redundancy_analysis(
+    df_metadata: pd.DataFrame,
+    base_out_dir: str,
+    output_prefix: str,
+    threads: int,
+    ani_threshold: float,
+    af_threshold: float,
+) -> Dict[str, object]:
+    skani_path = get_tool_path("skani")
+    if not skani_path:
+        return {"status": "no_tool", "message": "skani executable not found.", "cluster_count": 0}
+
+    genome_paths = [
+        os.path.join(base_out_dir, "genomes", str(name))
+        for name in df_metadata.get("Standardized_Name", pd.Series(dtype=str)).tolist()
+        if str(name).strip()
+    ]
+    genome_paths = [p for p in genome_paths if os.path.exists(p)]
+    if len(genome_paths) < 2:
+        return {"status": "not_enough_genomes", "message": "Need at least two genomes for ANI clustering.", "cluster_count": 0}
+
+    output_dir = os.path.dirname(output_prefix)
+    os.makedirs(output_dir, exist_ok=True)
+    ani_path = output_prefix + ".tsv"
+    af_path = ani_path + ".af"
+    log_path = output_prefix + ".log"
+    list_path = output_prefix + "_genomes.txt"
+    with open(list_path, "w", encoding="utf-8") as list_f:
+        list_f.write("\n".join(genome_paths) + "\n")
+    cmd = [skani_path, "triangle", "-l", list_path, "-E", "-s", "93", "-t", str(int(threads)), "-o", ani_path]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    with open(log_path, "w", encoding="utf-8") as logf:
+        logf.write("=== CMD ===\n")
+        logf.write(" ".join(cmd) + "\n\n")
+        logf.write("=== STDOUT ===\n")
+        logf.write(proc.stdout or "")
+        logf.write("\n=== STDERR ===\n")
+        logf.write(proc.stderr or "")
+        logf.write(f"\n=== EXIT CODE ===\n{proc.returncode}\n")
+    if proc.returncode != 0:
+        return {"status": "failed", "message": f"skani triangle failed; see {log_path}", "cluster_count": 0, "log_path": log_path}
+    if not os.path.exists(ani_path):
+        return {"status": "no_output", "message": f"skani output missing: {ani_path}", "cluster_count": 0, "log_path": log_path}
+
+    ani_values = _parse_skani_sparse_value_file(ani_path)
+    af_values = _parse_skani_sparse_value_file(af_path) if os.path.exists(af_path) else {}
+    uf = _UnionFind()
+    for standardized_name in df_metadata.get("Standardized_Name", pd.Series(dtype=str)).tolist():
+        token = str(standardized_name).strip()
+        if token:
+            uf.add(token)
+
+    edge_rows: List[Dict[str, object]] = []
+    qualifying_edges = 0
+    for (a_path, b_path), ani in ani_values.items():
+        a_name = os.path.basename(a_path)
+        b_name = os.path.basename(b_path)
+        af = af_values.get((a_path, b_path), af_values.get((b_path, a_path), float("nan")))
+        qualifies = ani >= ani_threshold and (pd.notna(af) and af >= af_threshold)
+        edge_rows.append(
+            {
+                "Genome_A": a_name,
+                "Genome_B": b_name,
+                "ANI": ani,
+                "AF": af if pd.notna(af) else "",
+                "ANI_Threshold": ani_threshold,
+                "AF_Threshold": af_threshold,
+                "Qualified_For_Cluster": bool(qualifies),
+            }
+        )
+        if qualifies:
+            qualifying_edges += 1
+            uf.union(a_name, b_name)
+
+    edge_csv = output_prefix + "_edges.csv"
+    pd.DataFrame(edge_rows).to_csv(edge_csv, index=False)
+
+    cluster_members: Dict[str, List[str]] = {}
+    for standardized_name in df_metadata.get("Standardized_Name", pd.Series(dtype=str)).tolist():
+        token = str(standardized_name).strip()
+        if not token:
+            continue
+        cluster_members.setdefault(uf.find(token), []).append(token)
+
+    cluster_rows: List[Dict[str, object]] = []
+    cluster_lookup: Dict[str, str] = {}
+    for cluster_idx, members in enumerate(sorted(cluster_members.values(), key=lambda m: (-len(m), m[0])), start=1):
+        cluster_id = f"ANI95AF60_{cluster_idx:04d}"
+        for member in sorted(members):
+            cluster_lookup[member] = cluster_id
+            row = df_metadata.loc[df_metadata["Standardized_Name"] == member].iloc[0]
+            cluster_rows.append(
+                {
+                    "ANI95_AF60_Cluster": cluster_id,
+                    "Cluster_Size": len(members),
+                    "Renamed_Genome_ID": row.get("Renamed_Genome_ID", ""),
+                    "Standardized_Name": member,
+                    "Original_Name": row.get("Original_Name", ""),
+                    "Original_Path": row.get("Original_Path", ""),
+                    "Completeness": row.get("Completeness", ""),
+                    "Contamination": row.get("Contamination", ""),
+                    "GTDB_Score": row.get("GTDB_Score", ""),
+                }
+            )
+    cluster_csv = output_prefix + "_clusters.csv"
+    pd.DataFrame(cluster_rows).to_csv(cluster_csv, index=False)
+    df_metadata["ANI95_AF60_Cluster"] = df_metadata["Standardized_Name"].map(cluster_lookup).fillna("")
+    multi_member_clusters = sum(1 for members in cluster_members.values() if len(members) > 1)
+    clustered_genomes = sum(len(members) for members in cluster_members.values() if len(members) > 1)
+    return {
+        "status": "ok",
+        "message": "",
+        "log_path": log_path,
+        "ani_path": ani_path,
+        "af_path": af_path if os.path.exists(af_path) else "",
+        "list_path": list_path,
+        "edge_csv": edge_csv,
+        "cluster_csv": cluster_csv,
+        "cluster_count": len(cluster_members),
+        "multi_member_clusters": multi_member_clusters,
+        "clustered_genomes": clustered_genomes,
+        "qualifying_edges": qualifying_edges,
+    }
+
+
 def standardize_fasta_stream(input_path: str, output_path: str, contig_prefix: str) -> Tuple[int, int, float]:
     contig_idx = 1
     contig_count = 0
@@ -214,7 +522,7 @@ def standardize_fasta_stream(input_path: str, output_path: str, contig_prefix: s
     with open(input_path, "r", encoding="utf-8") as fin, open(output_path, "w", encoding="utf-8") as fout:
         for line in fin:
             if line.startswith(">"):
-                fout.write(f">{contig_prefix}Contig{contig_idx:04d}\n")
+                fout.write(f">{contig_prefix}_{contig_idx:04d}\n")
                 contig_idx += 1
                 contig_count += 1
                 continue
@@ -302,9 +610,9 @@ def extract_rrna_sequences(
     if not seqs:
         return 0
     target = rrna_type.upper()
-    written = 0
+    entries: List[str] = []
     os.makedirs(os.path.dirname(output_fasta) or ".", exist_ok=True)
-    with open(gff_path, "r") as gff_in, open(output_fasta, "w") as out:
+    with open(gff_path, "r") as gff_in:
         for line in gff_in:
             if not line or line.startswith("#"):
                 continue
@@ -339,18 +647,25 @@ def extract_rrna_sequences(
                 if "=" in kv:
                     k, v = kv.split("=", 1)
                     attrs_dict[k.strip()] = v.strip()
-            product = attrs_dict.get("product", f"{rrna_type} rRNA")
-            name = attrs_dict.get("Name", f"{contig}_{start + 1}_{end}_{rrna_type}")
+            entries.append(sub)
+
+    total_entries = len(entries)
+    if total_entries == 0:
+        return 0
+
+    with open(output_fasta, "w", encoding="utf-8") as out:
+        for idx, sub in enumerate(entries, start=1):
             header_id, header_desc = format_rrna_header(
                 genome_name=genome_name,
                 rrna_type=rrna_type,
-                feature_index=written + 1,
-                feature_name=name,
-                contig=contig,
-                start=start + 1,
-                end=end,
-                strand=strand,
-                product=product,
+                feature_index=idx,
+                total_features=total_entries,
+                feature_name="",
+                contig="",
+                start=0,
+                end=0,
+                strand="",
+                product="",
                 source_folder=source_folder,
                 original_name=original_name,
                 original_subfolder=original_subfolder,
@@ -361,8 +676,7 @@ def extract_rrna_sequences(
                 out.write(f">{header_id}\n")
             for i in range(0, len(sub), 80):
                 out.write(sub[i : i + 80] + "\n")
-            written += 1
-    return written
+    return total_entries
 
 
 def run_barrnap(genome_fna: str, output_gff: str, output_rrna_fasta: str, kingdom: str, threads: int) -> Optional[str]:
@@ -535,6 +849,7 @@ def format_rrna_header(
     genome_name: str,
     rrna_type: str,
     feature_index: int,
+    total_features: int,
     feature_name: str,
     contig: str,
     start: int,
@@ -546,9 +861,12 @@ def format_rrna_header(
     original_subfolder: str = "",
 ) -> Tuple[str, str]:
     genome_base = os.path.splitext(os.path.basename(genome_name))[0] if genome_name else "GENOME"
-    genome_token = sanitize_alnum_token(genome_base, max_len=40, fallback_prefix="GENOME")
-    del feature_name, contig, start, end, strand, product, source_folder, original_name, original_subfolder
-    header_id = f"{genome_token}{rrna_type.upper()}{int(feature_index):04d}"
+    genome_token = genome_base.strip() or "GENOME"
+    del rrna_type, feature_name, contig, start, end, strand, product, source_folder, original_name, original_subfolder
+    if int(total_features) <= 1:
+        header_id = genome_token
+    else:
+        header_id = f"{genome_token}_{int(feature_index)}"
     return header_id, ""
 
 
@@ -558,7 +876,7 @@ def rrna_fasta_has_genome_metadata(path: str, genome_name: str, original_name: s
     del original_name
     candidate_names = [n for n in (genome_name,) if n]
     candidate_tokens = {
-        sanitize_alnum_token(os.path.splitext(os.path.basename(name))[0], max_len=40, fallback_prefix="GENOME")
+        (os.path.splitext(os.path.basename(name))[0].strip() or "GENOME")
         for name in candidate_names
         if os.path.splitext(os.path.basename(name))[0].strip()
     }
@@ -568,7 +886,7 @@ def rrna_fasta_has_genome_metadata(path: str, genome_name: str, original_name: s
                 if line.startswith(">"):
                     header = line[1:].strip().split()[0]
                     return bool(header) and (
-                        any(header.startswith(f"{token}16S") for token in candidate_tokens) or
+                        any(header == token or re.fullmatch(rf"{re.escape(token)}_\d+", header) for token in candidate_tokens) or
                         "|16S|" in header or
                         "genome=" in line
                     )
@@ -590,6 +908,7 @@ def rewrite_rrna_fasta_headers(
     source_folder = str(record.get("Source_Folder", "") or "")
     original_name = str(record.get("Original_Name", "") or "")
     original_subfolder = str(record.get("Original_Subfolder", "") or "")
+    total_records = fasta_record_count(fasta_path)
     try:
         with open(fasta_path, "r", encoding="utf-8") as src, open(tmp_path, "w", encoding="utf-8") as out:
             for line in src:
@@ -601,6 +920,7 @@ def rewrite_rrna_fasta_headers(
                         genome_name=genome_name,
                         rrna_type=rrna_type,
                         feature_index=seq_idx,
+                        total_features=total_records,
                         feature_name=feature_name,
                         contig=str(record.get("Contig_Header_Prefix", "") or genome_name or "CONTIG"),
                         start=seq_idx,
@@ -938,6 +1258,14 @@ def main():
         default=None,
         help="Collect all database-wide 16S sequences into one FASTA file. Existing per-genome 16S results are reused when possible.",
     )
+    parser.add_argument(
+        "--ani-cluster",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Run skani-based ANI redundancy analysis and report 95%% ANI / AF 60%% clusters. Default: disabled.",
+    )
+    parser.add_argument("--ani-threshold", type=float, default=95.0, help="ANI threshold for clustering. Default: 95.0.")
+    parser.add_argument("--af-threshold", type=float, default=60.0, help="AF threshold for clustering. Default: 60.0.")
     args = parser.parse_args()
 
     start = _dt.datetime.now()
@@ -946,12 +1274,16 @@ def main():
     checkm2_out_dir = os.path.join(base_out_dir, "checkm2_results")
     barrnap_out_dir = os.path.join(base_out_dir, "barrnap_results")
     new_genomes_out_dir = os.path.join(base_out_dir, "_new_genomes_for_qc")
+    redundancy_dir = os.path.join(base_out_dir, "redundancy_analysis")
     metadata_path = os.path.join(base_out_dir, f"{args.db_name}_{args.db_version}_metadata.csv")
     mapping_path = os.path.join(base_out_dir, f"{args.db_name}_{args.db_version}_genome_id_mapping.csv")
     scan_path = os.path.join(base_out_dir, f"{args.db_name}_{args.db_version}_scan_inventory.csv")
     source_inventory_path = os.path.join(base_out_dir, f"{args.db_name}_{args.db_version}_source_counts.csv")
     version_compare_path = os.path.join(base_out_dir, f"{args.db_name}_{args.db_version}_version_comparison.csv")
+    exact_duplicate_path = os.path.join(redundancy_dir, f"{args.db_name}_{args.db_version}_exact_duplicates.csv")
+    ani_output_prefix = os.path.join(redundancy_dir, f"{args.db_name}_{args.db_version}_ani95_af60")
     os.makedirs(genomes_out_dir, exist_ok=True)
+    os.makedirs(redundancy_dir, exist_ok=True)
     if args.run_barrnap:
         os.makedirs(barrnap_out_dir, exist_ok=True)
 
@@ -1053,11 +1385,26 @@ def main():
     next_genome_serial = len(records) + 1
 
     total_items = len(input_genomes)
+    progress_counts = {"new": 0, "current": 0, "existing": 0, "invalid": 0, "unreadable": 0}
+    progress_bar = tqdm(total=total_items, desc="Genome processing", unit="genome", dynamic_ncols=True) if total_items else None
+
+    def mark_progress(kind: str) -> None:
+        progress_counts[kind] = progress_counts.get(kind, 0) + 1
+        if progress_bar is not None:
+            progress_bar.update(1)
+            progress_bar.set_postfix(
+                new=progress_counts["new"],
+                resumed=progress_counts["current"],
+                carried=progress_counts["existing"],
+                skipped=progress_counts["invalid"] + progress_counts["unreadable"],
+                refresh=False,
+            )
+
     for idx, item in enumerate(input_genomes, start=1):
         if args.strict_fasta_check:
             is_valid_text, invalid_reason = is_probable_text_fasta(item.path)
             if not is_valid_text:
-                print(f"[{idx}/{total_items}] SKIP invalid FASTA: {item.path} ({invalid_reason})")
+                mark_progress("invalid")
                 scan_records.append(
                     {
                         "Original_Path": item.path,
@@ -1075,7 +1422,7 @@ def main():
         raw_md5 = compute_file_md5(item.path)
         if raw_md5 in current_md5_map:
             cur_row = current_md5_map[raw_md5]
-            print(f"[{idx}/{total_items}] RESUME existing current version: {item.path}")
+            mark_progress("current")
             scan_records.append(
                 {
                     "Original_Path": item.path,
@@ -1090,7 +1437,7 @@ def main():
             continue
         if raw_md5 in previous_md5_map:
             prev_row = previous_md5_map[raw_md5]
-            print(f"[{idx}/{total_items}] SKIP existing: {item.path}")
+            mark_progress("existing")
             scan_records.append(
                 {
                     "Original_Path": item.path,
@@ -1104,8 +1451,7 @@ def main():
             )
             continue
 
-        print(f"[{idx}/{total_items}] NEW processing: {item.path}")
-        source_code = make_source_code(item.source_folder, max_len=10)
+        source_code = make_source_letters(item.source_folder, max_len=3)
         renamed_genome_id = build_renamed_genome_id(args.db_name, item.source_folder, next_genome_serial)
         next_genome_serial += 1
         new_filename = ensure_unique_filename(genomes_out_dir, renamed_genome_id, ".fna")
@@ -1116,7 +1462,7 @@ def main():
         try:
             size_bp, contigs, gc = standardize_fasta_stream(item.path, out_path, contig_prefix)
         except (UnicodeDecodeError, ValueError, OSError) as exc:
-            print(f"[{idx}/{total_items}] SKIP unreadable FASTA: {item.path} ({exc})")
+            mark_progress("unreadable")
             try:
                 if os.path.exists(out_path):
                     os.remove(out_path)
@@ -1159,7 +1505,6 @@ def main():
                 # barrnap's own --outseq which only emits the full rRNA mix.
                 if os.path.exists(rrna_16s_path) and fasta_record_count(rrna_16s_path) > 0:
                     n_16s = fasta_record_count(rrna_16s_path)
-                    print(f"[{idx}/{total_items}] REUSE 16S FASTA: {rrna_16s_path}")
                 else:
                     n_16s = extract_rrna_sequences(
                         out_path,
@@ -1215,6 +1560,17 @@ def main():
                 "Renamed_Genome_ID": contig_prefix,
                 "Standardized_Name": new_filename,
             }
+        )
+        mark_progress("new")
+
+    if progress_bar is not None:
+        progress_bar.close()
+        print(
+            "Progress summary: "
+            f"new={progress_counts['new']}, "
+            f"current_resumed={progress_counts['current']}, "
+            f"carried_forward_hits={progress_counts['existing']}, "
+            f"invalid_or_unreadable={progress_counts['invalid'] + progress_counts['unreadable']}"
         )
 
     checkm2_result: Dict[str, object] = {"status": "skipped", "scores": {}, "db_path": "", "message": ""}
@@ -1317,30 +1673,18 @@ def main():
         "Quality_Status",
         "Quality_Message",
         "barrnap_16S_fasta",
+        "Genome_Size_bp",
+        "Contig_Count",
+        "GC_Content_%",
+        "Completeness",
+        "Contamination",
+        "GTDB_Score",
+        "Exact_Sequence_MD5",
+        "Exact_Duplicate_Group",
+        "ANI95_AF60_Cluster",
     ]:
         if col not in df_metadata.columns:
             df_metadata[col] = ""
-    df_metadata.to_csv(metadata_path, index=False)
-
-    mapping_df = df_metadata[
-        [
-            "Renamed_Genome_ID",
-            "Standardized_Name",
-            "Source_Code",
-            "Genome_Serial",
-            "Sequence_Header_Prefix",
-            "Contig_Header_Prefix",
-            "Original_Name",
-            "Original_Path",
-            "Original_Subfolder",
-            "Source_Folder",
-            "File_MD5",
-            "rRNA_total",
-            "Version_Status",
-            "Database_Version",
-        ]
-    ].copy()
-    mapping_df.to_csv(mapping_path, index=False)
 
     scan_df = pd.DataFrame(scan_records)
     scan_df.to_csv(scan_path, index=False)
@@ -1371,12 +1715,66 @@ def main():
         collect_path = os.path.abspath(os.path.expanduser(args.collect_16s_to))
         collect_16s_result = collect_database_16s_records(records, base_out_dir, collect_path)
         df_metadata = pd.DataFrame(records)
-        df_metadata.to_csv(metadata_path, index=False)
         print(
             "Collected database-wide 16S: "
             f"{collect_16s_result['sequence_count']} sequences from "
             f"{collect_16s_result['genomes_with_16s']} genomes -> {collect_path}"
         )
+
+    exact_duplicate_result = build_exact_duplicate_report(df_metadata, base_out_dir, exact_duplicate_path)
+    ani_cluster_result: Dict[str, object] = {
+        "status": "not_requested",
+        "message": "ANI clustering not requested.",
+        "cluster_count": 0,
+    }
+    if args.ani_cluster:
+        print(
+            f"Running ANI clustering with skani (ANI>={args.ani_threshold}, AF>={args.af_threshold})..."
+        )
+        ani_cluster_result = run_skani_redundancy_analysis(
+            df_metadata,
+            base_out_dir,
+            ani_output_prefix,
+            args.threads,
+            args.ani_threshold,
+            args.af_threshold,
+        )
+        print(f"ANI clustering status: {ani_cluster_result.get('status')}")
+        if ani_cluster_result.get("message"):
+            print(f"ANI clustering message: {ani_cluster_result['message']}")
+
+    df_metadata.to_csv(metadata_path, index=False)
+
+    mapping_df = df_metadata[
+        [
+            "Renamed_Genome_ID",
+            "Standardized_Name",
+            "Source_Code",
+            "Genome_Serial",
+            "Sequence_Header_Prefix",
+            "Contig_Header_Prefix",
+            "Original_Name",
+            "Original_Path",
+            "Original_Subfolder",
+            "Source_Folder",
+            "File_MD5",
+            "Genome_Size_bp",
+            "Contig_Count",
+            "GC_Content_%",
+            "Completeness",
+            "Contamination",
+            "GTDB_Score",
+            "rRNA_total",
+            "rRNA_16S_count",
+            "Exact_Duplicate_Group",
+            "ANI95_AF60_Cluster",
+            "Version_Status",
+            "Database_Version",
+        ]
+    ].copy()
+    mapping_df.to_csv(mapping_path, index=False)
+
+    metric_sections = summarize_metadata_metrics(df_metadata)
 
     end = _dt.datetime.now()
     summary_lines = []
@@ -1394,6 +1792,9 @@ def main():
     summary_lines.append(f"Run CheckM2: {args.run_checkm2}")
     summary_lines.append(f"Run barrnap: {args.run_barrnap}")
     summary_lines.append(f"Collect all 16S to: {args.collect_16s_to or ''}")
+    summary_lines.append(f"Run ANI clustering: {args.ani_cluster}")
+    summary_lines.append(f"ANI threshold: {args.ani_threshold}")
+    summary_lines.append(f"AF threshold: {args.af_threshold}")
     summary_lines.append(f"Exclude hidden files: {args.exclude_hidden}")
     summary_lines.append(f"Strict FASTA check: {args.strict_fasta_check}")
     if args.run_barrnap:
@@ -1445,6 +1846,37 @@ def main():
         summary_lines.append(f"16S regenerated from GFF: {collect_16s_result['generated_files']}")
         summary_lines.append(f"Genomes without 16S: {collect_16s_result['missing_files']}")
     summary_lines.append("")
+    summary_lines.append("--- Sequence Metrics ---")
+    for line in metric_sections["size"]:
+        summary_lines.append(line)
+    summary_lines.append("")
+    summary_lines.append("--- Quality Metrics ---")
+    for line in metric_sections["quality"]:
+        summary_lines.append(line)
+    summary_lines.append("")
+    summary_lines.append("--- 16S Status ---")
+    for line in metric_sections["rrna16s"]:
+        summary_lines.append(line)
+    summary_lines.append("")
+    summary_lines.append("--- Redundancy ---")
+    summary_lines.append(f"Exact duplicate CSV: {os.path.abspath(exact_duplicate_result['output_csv'])}")
+    summary_lines.append(f"Exact duplicate groups: {exact_duplicate_result['duplicate_group_count']}")
+    summary_lines.append(f"Genomes in exact duplicate groups: {exact_duplicate_result['duplicate_genome_count']}")
+    if args.ani_cluster:
+        summary_lines.append(f"ANI clustering status: {ani_cluster_result.get('status', 'unknown')}")
+        if ani_cluster_result.get("message"):
+            summary_lines.append(f"ANI clustering message: {ani_cluster_result['message']}")
+        if ani_cluster_result.get("edge_csv"):
+            summary_lines.append(f"ANI edge CSV: {os.path.abspath(str(ani_cluster_result['edge_csv']))}")
+        if ani_cluster_result.get("cluster_csv"):
+            summary_lines.append(f"ANI cluster CSV: {os.path.abspath(str(ani_cluster_result['cluster_csv']))}")
+        if ani_cluster_result.get("log_path"):
+            summary_lines.append(f"ANI log: {os.path.abspath(str(ani_cluster_result['log_path']))}")
+        summary_lines.append(f"ANI cluster count: {ani_cluster_result.get('cluster_count', 0)}")
+        summary_lines.append(f"Multi-member ANI clusters: {ani_cluster_result.get('multi_member_clusters', 0)}")
+        summary_lines.append(f"Genomes in ANI multi-member clusters: {ani_cluster_result.get('clustered_genomes', 0)}")
+        summary_lines.append(f"Qualifying ANI edges: {ani_cluster_result.get('qualifying_edges', 0)}")
+    summary_lines.append("")
     summary_lines.append("--- Output ---")
     summary_lines.append(f"Standardized genomes: {len(records)}")
     summary_lines.append(f"Output dir: {os.path.abspath(base_out_dir)}")
@@ -1457,6 +1889,28 @@ def main():
     summary_lines.append("=" * 60)
     log_path = os.path.join(base_out_dir, "build_summary.log")
     write_summary_log(log_path, summary_lines)
+
+    print("== Build Metrics ==")
+    for line in metric_sections["size"]:
+        print(f"  {line}")
+    for line in metric_sections["quality"]:
+        print(f"  {line}")
+    if args.run_barrnap or args.collect_16s_to:
+        for line in metric_sections["rrna16s"]:
+            print(f"  {line}")
+    print("== Redundancy ==")
+    print(
+        "  Exact duplicates: "
+        f"{exact_duplicate_result['duplicate_group_count']} groups / "
+        f"{exact_duplicate_result['duplicate_genome_count']} genomes"
+    )
+    if args.ani_cluster:
+        print(
+            "  ANI95 AF60 clusters: "
+            f"status={ani_cluster_result.get('status')}, "
+            f"clusters={ani_cluster_result.get('cluster_count', 0)}, "
+            f"multi_member={ani_cluster_result.get('multi_member_clusters', 0)}"
+        )
 
     if os.path.isdir(new_genomes_out_dir):
         shutil.rmtree(new_genomes_out_dir, ignore_errors=True)
