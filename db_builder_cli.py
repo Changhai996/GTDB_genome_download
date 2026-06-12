@@ -316,6 +316,7 @@ def extract_rrna_sequences(
             header_id, header_desc = format_rrna_header(
                 genome_name=genome_name,
                 rrna_type=rrna_type,
+                feature_index=written + 1,
                 feature_name=name,
                 contig=contig,
                 start=start + 1,
@@ -326,7 +327,10 @@ def extract_rrna_sequences(
                 original_name=original_name,
                 original_subfolder=original_subfolder,
             )
-            out.write(f">{header_id} {header_desc}\n")
+            if header_desc:
+                out.write(f">{header_id} {header_desc}\n")
+            else:
+                out.write(f">{header_id}\n")
             for i in range(0, len(sub), 80):
                 out.write(sub[i : i + 80] + "\n")
             written += 1
@@ -499,13 +503,10 @@ def fasta_record_count(path: str) -> int:
     return count
 
 
-def _safe_header_value(value: object) -> str:
-    return re.sub(r"\s+", "_", str(value or "").strip()) or "NA"
-
-
 def format_rrna_header(
     genome_name: str,
     rrna_type: str,
+    feature_index: int,
     feature_name: str,
     contig: str,
     start: int,
@@ -518,32 +519,22 @@ def format_rrna_header(
 ) -> Tuple[str, str]:
     genome_base = os.path.splitext(os.path.basename(genome_name))[0] if genome_name else "GENOME"
     genome_token = sanitize_token(genome_base, 100, "GENOME")
-    feature_token = sanitize_token(feature_name, 80, rrna_type.upper())
-    contig_token = sanitize_token(contig, 80, "CONTIG")
-    header_id = f"{genome_token}|{rrna_type.upper()}|{feature_token}|{contig_token}|{start}-{end}|{strand}"
-    header_desc = (
-        f"genome={_safe_header_value(genome_name or genome_base)} "
-        f"source={_safe_header_value(source_folder)} "
-        f"original={_safe_header_value(original_name)} "
-        f"subfolder={_safe_header_value(original_subfolder)} "
-        f"contig={_safe_header_value(contig)} "
-        f"range={start}-{end} strand={_safe_header_value(strand)} "
-        f"feature={_safe_header_value(feature_name)} "
-        f"product={_safe_header_value(product)}"
-    )
-    return header_id, header_desc
+    del feature_name, contig, start, end, strand, product, source_folder, original_name, original_subfolder
+    header_id = f"{genome_token}_{rrna_type.upper()}_{int(feature_index)}"
+    return header_id, ""
 
 
 def rrna_fasta_has_genome_metadata(path: str, genome_name: str) -> bool:
     if not os.path.exists(path):
         return False
     genome_base = os.path.splitext(os.path.basename(genome_name))[0] if genome_name else ""
+    genome_token = sanitize_token(genome_base, 100, "GENOME")
     try:
         with open(path, "r", encoding="utf-8") as fh:
             for line in fh:
                 if line.startswith(">"):
-                    header = line.strip()
-                    return ("genome=" in header) and (genome_base in header or genome_name in header)
+                    header = line[1:].strip().split()[0]
+                    return bool(header) and header.startswith(f"{genome_token}_16S_")
     except OSError:
         return False
     return False
@@ -572,6 +563,7 @@ def rewrite_rrna_fasta_headers(
                     header_id, header_desc = format_rrna_header(
                         genome_name=genome_name,
                         rrna_type=rrna_type,
+                        feature_index=seq_idx,
                         feature_name=feature_name,
                         contig=str(record.get("Contig_Header_Prefix", "") or genome_name or "CONTIG"),
                         start=seq_idx,
@@ -582,7 +574,10 @@ def rewrite_rrna_fasta_headers(
                         original_name=original_name,
                         original_subfolder=original_subfolder,
                     )
-                    out.write(f">{header_id} {header_desc}\n")
+                    if header_desc:
+                        out.write(f">{header_id} {header_desc}\n")
+                    else:
+                        out.write(f">{header_id}\n")
                 else:
                     out.write(line)
         os.replace(tmp_path, fasta_path)
